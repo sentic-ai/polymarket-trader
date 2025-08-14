@@ -22,8 +22,9 @@ try:
 except ImportError:
     from langchain.chat_models import ChatOpenAI
 
-from .models import MarketOdds, OrderModel, StateModel, SentimentAnalysisResponse
-from .storage import append_order, load_state, save_state
+from langchain_core.tools import tool
+
+from .models import MarketOdds, OrderModel, SentimentAnalysisResponse
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -185,6 +186,7 @@ def _fallback_sentiment(headline: str) -> float:
 # Public tool functions
 # ---------------------------------------------------------------------------
 
+@tool
 def get_market_odds() -> dict:
     """Return current YES/NO prices.
 
@@ -194,11 +196,13 @@ def get_market_odds() -> dict:
     return odds.model_dump()
 
 
+@tool
 def get_news() -> List[str]:
     """Return a list of raw Bitcoin news headlines."""
     return _fetch_news()
 
 
+@tool
 def analyze_sentiment(headlines: List[str]) -> List[dict]:
     """Analyze sentiment of headlines using LLM for sophisticated market analysis.
 
@@ -215,38 +219,23 @@ def analyze_sentiment(headlines: List[str]) -> List[dict]:
     return _analyze_sentiment_with_llm(headlines)
 
 
+@tool  
 def trade(side: Literal["BUY", "SELL"], usd: float) -> dict:
-    """Simulate a trade on the target market.
-
-    Automatically adjusts trade size to maximum possible if requested amount 
-    exceeds available balance/holdings. This reduces LLM costs by avoiding 
-    failed trades and subsequent retry calls.
+    """Execute a trade on the target market.
+    
+    This tool simulates trade execution and returns the trade details.
+    The apply_updates node will calculate balance/holdings changes.
+    
+    Parameters:
+    - side: BUY or SELL  
+    - usd: Trade amount in USD
     """
-    state = load_state() or StateModel(balance=1000.0, holdings=0.0, last_5_actions=[], timestamp=datetime.now(timezone.utc))
-
     odds = _fetch_polymarket_prices()
     price = odds.yes_price
     timestamp = datetime.now(timezone.utc)
     
-    original_usd = usd
-    adjusted = False
-
-    if side == "BUY":
-        if usd > state.balance:
-            usd = state.balance  # Auto-adjust to max buyable
-            adjusted = True
-        contracts = usd / price
-        state.balance -= usd
-        state.holdings += contracts
-    else:  # SELL
-        max_sellable_usd = state.holdings * price
-        if usd > max_sellable_usd:
-            usd = max_sellable_usd  # Auto-adjust to max sellable
-            adjusted = True
-        contracts = usd / price
-        state.balance += usd
-        state.holdings -= contracts
-
+    contracts = usd / price
+    
     order = OrderModel(
         id=str(uuid.uuid4()),
         side=side,
@@ -254,25 +243,22 @@ def trade(side: Literal["BUY", "SELL"], usd: float) -> dict:
         price=price,
         timestamp=timestamp,
     )
-    state.last_5_actions = (state.last_5_actions + [f"{side} ${usd:.2f} @ {price:.2f}"])[-5:]
-    state.timestamp = timestamp
 
-    # Persist changes
-    append_order(order)
-    save_state(state)
-
-    result = {
-        "order": order.model_dump(),
-        "new_state": state.model_dump(),
+    return {
+        "tool_name": "trade",
+        "order": {
+            "id": order.id,
+            "side": order.side,
+            "usd_size": order.usd_size,
+            "price": order.price,
+            "timestamp": order.timestamp.isoformat()  # Convert datetime to JSON-serializable string
+        },
+        "side": side,
+        "usd_amount": usd,
+        "price": price,
+        "contracts": contracts,
+        "action_summary": f"{side} ${usd:.2f} @ {price:.2f}"
     }
-    
-    if adjusted:
-        result["adjusted"] = True
-        result["original_amount"] = original_usd
-        result["executed_amount"] = usd
-        result["note"] = f"Auto-adjusted from ${original_usd:.2f} to ${usd:.2f} (max available)"
-
-    return result
 
 
 TOOLS = [get_market_odds, get_news, analyze_sentiment, trade]

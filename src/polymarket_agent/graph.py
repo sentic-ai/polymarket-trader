@@ -24,7 +24,6 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .storage import load_state
 from .tools import TOOLS
 
 # ---------------------------------------------------------------------------
@@ -44,22 +43,28 @@ class AgentState(TypedDict):
 
     - ``messages``: Conversation history (System, Human, AI, Tool)
     - ``step``:     How many tool steps have been executed?
+    - ``balance``:  Current USD balance
+    - ``holdings``: Number of YES-contracts held
+    - ``last_5_actions``: Recent trading actions history
     """
 
     messages: Annotated[List[BaseMessage], add_messages]
     step: int
+    balance: float
+    holdings: float
+    last_5_actions: List[str]
 
 
 # ---------------------------------------------------------------------------
 # Node 1 – ContextBuilder
 # ---------------------------------------------------------------------------
 
-def build_context(_: AgentState) -> Dict[str, List[BaseMessage]]:
+def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | List[str]]:
     """Creates the initial prompt based on persistent state."""
-    saved = load_state()
-    balance = saved.balance if saved else 1000.0
-    holdings = saved.holdings if saved else 0.0
-    history = " | ".join(saved.last_5_actions if saved else []) or "(none)"
+    balance = state.get("balance", 1000.0)
+    holdings = state.get("holdings", 0.0) 
+    last_actions = state.get("last_5_actions", [])
+    history = " | ".join(last_actions) or "(none)"
 
     system_prompt = (
         "You are TraderGPT, an autonomous trading agent for Polymarket prediction markets.\n\n"
@@ -90,10 +95,20 @@ def build_context(_: AgentState) -> Dict[str, List[BaseMessage]]:
             f"Last actions: {history}"
         )
     )
-    return {
+    result = {
         "messages": [system_msg, user_msg],
         "step": 0,
     }
+    
+    # Only set defaults if these values don't exist in state (first run)
+    if "balance" not in state:
+        result["balance"] = balance
+    if "holdings" not in state:
+        result["holdings"] = holdings  
+    if "last_5_actions" not in state:
+        result["last_5_actions"] = last_actions
+        
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +140,70 @@ def call_model(state: AgentState) -> Dict[str, List[AIMessage] | int]:
 
 
 # ---------------------------------------------------------------------------
+# Node 3 – Apply Updates (processes tool results and updates state)
+# ---------------------------------------------------------------------------
+
+def apply_updates(state: AgentState) -> Dict[str, float | List[str]]:
+    """Apply state updates from tool results."""
+    updates = {}
+    
+    if not state.get("messages"):
+        return updates
+    
+    # Look for ToolMessages from the most recent tool execution
+    for message in reversed(state["messages"]):
+        # Only process trade tool results for state updates
+        if (hasattr(message, 'type') and message.type == 'tool' and 
+            getattr(message, 'name', '') == 'trade'):
+            
+            tool_content = message.content
+            
+            # Parse tool content
+            if isinstance(tool_content, str):
+                try:
+                    import json
+                    result = json.loads(tool_content)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            elif isinstance(tool_content, dict):
+                result = tool_content
+            else:
+                continue
+            
+            # Process trade tool result
+            if result and isinstance(result, dict) and result.get('tool_name') == 'trade':
+                side = result.get('side')
+                usd_amount = result.get('usd_amount', 0)
+                price = result.get('price', 1)
+                
+                current_balance = state.get('balance', 1000.0)
+                current_holdings = state.get('holdings', 0.0)
+                
+                # Calculate state updates based on trade
+                if side == 'BUY':
+                    actual_usd = min(usd_amount, current_balance)
+                    actual_contracts = actual_usd / price
+                    updates['balance'] = current_balance - actual_usd
+                    updates['holdings'] = current_holdings + actual_contracts
+                elif side == 'SELL':
+                    max_sellable_usd = current_holdings * price
+                    actual_usd = min(usd_amount, max_sellable_usd)
+                    actual_contracts = actual_usd / price
+                    updates['balance'] = current_balance + actual_usd
+                    updates['holdings'] = current_holdings - actual_contracts
+                
+                # Update action history
+                if 'action_summary' in result:
+                    current_actions = state.get('last_5_actions', [])
+                    new_actions = (current_actions + [result['action_summary']])[-5:]
+                    updates['last_5_actions'] = new_actions
+                
+                break  # Only process most recent trade
+    
+    return updates
+
+
+# ---------------------------------------------------------------------------
 # Edge routing function
 # ---------------------------------------------------------------------------
 
@@ -149,16 +228,22 @@ builder = StateGraph(AgentState)
 builder.add_node("context", build_context)
 builder.add_node("llm", call_model)
 builder.add_node("tools", ToolNode(TOOLS))
+builder.add_node("apply_updates", apply_updates)
 
 builder.add_edge("__start__", "context")
 builder.add_edge("context", "llm")
 
 # After LLM, decide whether __end__ or tools
 builder.add_conditional_edges("llm", route_after_llm)
-# After tools, go directly back to LLM
-builder.add_edge("tools", "llm")
+# After tools, apply updates then go back to LLM
+builder.add_edge("tools", "apply_updates")
+builder.add_edge("apply_updates", "llm")
 
-# Finalize
+
+# from langgraph.checkpoint.memory import InMemorySaver
+# agent_graph = builder.compile(checkpointer=InMemorySaver(), name="PolymarketTraderAgent")
+
+# Langgraph API mode/studio compatible (local mode)
 agent_graph = builder.compile(name="PolymarketTraderAgent")
 
 __all__ = [
