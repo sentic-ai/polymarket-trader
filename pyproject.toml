@@ -1,0 +1,25 @@
+[project]
+name = "polymarket_agent"
+version = "0.1.0"
+description = "Demo agent that trades a fixed Polymarket contract using LangGraph"
+authors = [{ name = "Sentic" }]
+requires-python = ">=3.10"
+dependencies = [
+    "langchain>=0.1.0",
+    "langchain-openai>=0.0.8",
+    "langgraph>=0.6.2",
+    "pydantic>=2,<3",
+    "requests",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+]
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"

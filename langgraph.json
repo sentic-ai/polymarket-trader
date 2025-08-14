@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "trader": "polymarket_agent.graph:agent_graph"
+  },
+  "env": ".env"
+}
