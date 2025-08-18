@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 from typing_extensions import TypedDict, Annotated
 
 try:
@@ -24,7 +24,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .tools import TOOLS
+from .tools import TOOLS, get_market_odds, get_news
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,12 +33,17 @@ from .tools import TOOLS
 MODEL_NAME = os.getenv("POLY_AGENT_MODEL", "gpt-4o-mini")  # configurable
 MAX_TOOL_STEPS = int(os.getenv("POLY_AGENT_MAX_STEPS", "6"))
 
+# Entry guard configuration
+MIN_PRICE_CHANGE_BPS = int(os.getenv("POLY_AGENT_MIN_PRICE_CHANGE_BPS", "25"))  # 0.25%
+SEC_TIME_BETWEEN_RUNS = int(os.getenv("POLY_AGENT_SEC_TIME_BETWEEN_RUNS", "300"))  # 5 minutes
+REQUIRE_NEW_NEWS = os.getenv("POLY_AGENT_REQUIRE_NEW_NEWS", "true").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Graph State Definitions
 # ---------------------------------------------------------------------------
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     """Shared graph state.
 
     - ``messages``: Conversation history (System, Human, AI, Tool)
@@ -46,6 +51,11 @@ class AgentState(TypedDict):
     - ``balance``:  Current USD balance
     - ``holdings``: Number of YES-contracts held
     - ``last_5_actions``: Recent trading actions history
+    - ``news``: Latest news headlines from get_news tool
+    - ``market_odds``: Latest market odds from get_market_odds tool
+    - ``last_run_timestamp``: Timestamp of last completed run
+    - ``_skip_run``: Internal flag to skip run (set by entry_guard)
+    - ``skip_reason``: Reason why run was skipped (if applicable)
     """
 
     messages: Annotated[List[BaseMessage], add_messages]
@@ -53,36 +63,88 @@ class AgentState(TypedDict):
     balance: float
     holdings: float
     last_5_actions: List[str]
+    news: Optional[List[str]]
+    market_odds: Optional[Dict[str, float]]
+    last_run_timestamp: Optional[datetime]
+    _skip_run: Optional[bool]
+    skip_reason: Optional[str]
 
 
 # ---------------------------------------------------------------------------
 # Node 1 – ContextBuilder
 # ---------------------------------------------------------------------------
 
-def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | List[str]]:
+def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | List[str] | datetime | bool | None]:
     """Creates the initial prompt based on persistent state."""
     balance = state.get("balance", 1000.0)
     holdings = state.get("holdings", 0.0) 
     last_actions = state.get("last_5_actions", [])
+    news = state.get("news", None)
+    market_odds = state.get("market_odds", None)
+    last_run_timestamp = state.get("last_run_timestamp", None)
+    skip_run = state.get("_skip_run", None)
     history = " | ".join(last_actions) or "(none)"
 
     system_prompt = (
-        "You are TraderGPT, an autonomous trading agent for Polymarket prediction markets.\n\n"
-        "OBJECTIVE: Maximize profit by trading YES/NO contracts based on market odds and news sentiment.\n\n"
-        "TRADING RULES:\n"
-        "- BUY when: Market undervalues YES probability vs. your analysis\n"
-        "- SELL when: Market overvalues YES probability vs. your analysis  \n"
-        "- HOLD when: Fair pricing or insufficient signal\n\n"
-        "PROCESS:\n"
-        "1. Get current market odds\n"
-        "2. Get recent news headlines\n"
-        "3. Analyze sentiment to gauge market direction\n"
-        "4. Make trading decision based on combined analysis\n\n"
-        "IMPORTANT:\n"
-        "- Trade amounts are automatically adjusted to your maximum available funds/holdings\n"
-        "- Consider position size relative to conviction level\n"
-        "- Factor in current holdings when making decisions\n"
-        "- Be concise in your reasoning\n\n"
+        "You are TraderGPT, an elite AI trading agent specializing in Polymarket prediction markets.\n\n"
+    
+    "IDENTITY: You combine quantitative analysis with geopolitical insight, behavioral economics, "
+    "and information asymmetry detection to find alpha in prediction markets.\n\n"
+    
+    "CORE STRATEGY FRAMEWORK:\n"
+    "1. INFORMATION EDGE: Identify what the market is missing\n"
+    "   - Detect narrative shifts before they're priced in\n"
+    "   - Find contradictions between betting markets and fundamentals\n"
+    "   - Spot overreactions to noise vs. signal\n\n"
+    
+    "2. MARKET PSYCHOLOGY: Exploit behavioral biases\n"
+    "   - Recency bias: Markets overweight recent events\n"
+    "   - Availability heuristic: Vivid news gets overpriced\n"
+    "   - Herd behavior: Identify crowded trades to fade\n"
+    "   - Anchoring: Markets slow to update from initial odds\n\n"
+    
+    "3. ADVANCED TACTICS:\n"
+    "   - MOMENTUM PLAY: Ride trends with strong catalysts\n"
+    "   - MEAN REVERSION: Fade extreme moves without fundamental basis\n"
+    "   - VOLATILITY ARBITRAGE: Buy underpriced uncertainty\n"
+    "   - EVENT CATALYST: Position before predictable news flow\n"
+    "   - CORRELATION TRADE: Exploit mispricing across related markets\n\n"
+    
+    "4. RISK MANAGEMENT:\n"
+    "   - Kelly Criterion sizing: Bet size proportional to edge\n"
+    "   - Never risk more than 25% on single high-conviction play\n"
+    "   - Scale into positions: 30% initial, add on confirmation\n"
+    "   - Cut losses at -15% unless thesis remains intact\n\n"
+    
+    "TRADING SIGNALS (Combine multiple for conviction):\n"
+    "- STRONG BUY: 3+ bullish signals, <40% market odds, high conviction\n"
+    "- BUY: Information asymmetry detected, market lagging narrative\n"
+    "- SELL: Euphoria detected, odds >80% on weak fundamentals\n"
+    "- SHORT: Crowd psychology at extremes, catalyst for reversal\n"
+    "- HOLD: Mixed signals or fair value\n\n"
+    
+    "DECISION FRAMEWORK:\n"
+    "1. Scan market odds vs. your Bayesian prior\n"
+    "2. Analyze news for:\n"
+    "   - What's priced in vs. what's new information\n"
+    "   - Second-order effects markets might miss\n"
+    "   - Sentiment extremes to fade\n"
+    "3. Identify the market's blind spot\n"
+    "4. Size position based on:\n"
+    "   - Conviction level (1-10 scale)\n"
+    "   - Risk/reward asymmetry\n"
+    "   - Current exposure\n\n"
+    
+    "OUTPUT FORMAT:\n"
+    "🎯 THESIS: [One-line insight the market is missing]\n"
+    "📊 EDGE: [Specific mispricing or behavioral bias to exploit]\n"
+    "🎲 CONVICTION: [X/10]\n"
+    "💰 ACTION: [BUY/SELL X% of capital]\n"
+    "📈 TARGET: [Expected odds in X timeframe]\n\n"
+    
+    "Remember: The best trades are contrarian with a catalyst. Don't just follow news—find "
+    "what others overlook. Your reputation depends on making non-obvious, profitable calls."
+
         "You have up to 6 tool calls. End with your final decision."
     )
     system_msg = SystemMessage(content=system_prompt)
@@ -107,6 +169,14 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
         result["holdings"] = holdings  
     if "last_5_actions" not in state:
         result["last_5_actions"] = last_actions
+    if "news" not in state:
+        result["news"] = news
+    if "market_odds" not in state:
+        result["market_odds"] = market_odds
+    if "last_run_timestamp" not in state:
+        result["last_run_timestamp"] = last_run_timestamp
+    if "_skip_run" not in state:
+        result["_skip_run"] = skip_run
         
     return result
 
@@ -143,34 +213,38 @@ def call_model(state: AgentState) -> Dict[str, List[AIMessage] | int]:
 # Node 3 – Apply Updates (processes tool results and updates state)
 # ---------------------------------------------------------------------------
 
-def apply_updates(state: AgentState) -> Dict[str, float | List[str]]:
+def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, float] | datetime | bool]:
     """Apply state updates from tool results."""
     updates = {}
     
     if not state.get("messages"):
         return updates
     
-    # Look for ToolMessages from the most recent tool execution
+    # Process ALL ToolMessages from the most recent tool execution batch
+    # We need to process all tool results, not just the last one
     for message in reversed(state["messages"]):
-        # Only process trade tool results for state updates
-        if (hasattr(message, 'type') and message.type == 'tool' and 
-            getattr(message, 'name', '') == 'trade'):
+        if not (hasattr(message, 'type') and message.type == 'tool'):
+            continue
             
-            tool_content = message.content
-            
-            # Parse tool content
-            if isinstance(tool_content, str):
-                try:
-                    import json
-                    result = json.loads(tool_content)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-            elif isinstance(tool_content, dict):
+        tool_name = getattr(message, 'name', '')
+        tool_content = message.content
+        
+        # Parse tool content
+        if isinstance(tool_content, str):
+            try:
+                import json
+                result = json.loads(tool_content)
+            except (json.JSONDecodeError, TypeError):
+                # For simple string results (like news headlines)
                 result = tool_content
-            else:
-                continue
-            
-            # Process trade tool result
+        elif isinstance(tool_content, (dict, list)):
+            result = tool_content
+        else:
+            continue
+        
+        # Process different tool results - don't break, continue processing all tools
+        if tool_name == 'trade':
+            # Process trade tool result (existing logic)
             if result and isinstance(result, dict) and result.get('tool_name') == 'trade':
                 side = result.get('side')
                 usd_amount = result.get('usd_amount', 0)
@@ -197,8 +271,77 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str]]:
                     current_actions = state.get('last_5_actions', [])
                     new_actions = (current_actions + [result['action_summary']])[-5:]
                     updates['last_5_actions'] = new_actions
-                
-                break  # Only process most recent trade
+        
+        elif tool_name == 'get_news':
+            # Process news tool result
+            if isinstance(result, list):
+                updates['news'] = result
+        
+        elif tool_name == 'get_market_odds':
+            # Process market odds tool result
+            if isinstance(result, dict):
+                updates['market_odds'] = result
+    
+    # Update last run timestamp to mark completion of this run
+    updates['last_run_timestamp'] = datetime.now(tz=UTC)
+    
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# Node 0 – Entry Guard (preflight checks)
+# ---------------------------------------------------------------------------
+
+def entry_guard(state: AgentState) -> Dict[str, List[str] | Dict[str, float] | datetime | bool | None]:
+    """Performs preflight checks before running the trading agent.
+    
+    Checks:
+    1. Price change threshold (basis points)
+    2. Time between runs
+    3. New news requirement
+    
+    If any check fails, routes to end. Otherwise clears stale data.
+    """
+    now = datetime.now(tz=UTC)
+    updates = {}
+    
+    # Get current market data and news (without storing in state)
+    current_market_odds = get_market_odds.invoke({})
+    current_news = get_news.invoke({})
+    
+    # Check 1: Time between runs
+    last_run = state.get("last_run_timestamp")
+    if last_run is not None:
+        time_since_last = (now - last_run).total_seconds()
+        if time_since_last < SEC_TIME_BETWEEN_RUNS:
+            reason = f"Time check: only {time_since_last:.0f}s since last run (need {SEC_TIME_BETWEEN_RUNS}s)"
+            print(f"ENTRY_GUARD: Skipping run - {reason}")
+            return {"_skip_run": True, "skip_reason": reason}
+    
+    # Check 2: Price change threshold
+    old_market_odds = state.get("market_odds")
+    if old_market_odds is not None:
+        old_yes_price = old_market_odds.get("yes_price", 0)
+        new_yes_price = current_market_odds.get("yes_price", 0)
+        
+        price_change_bps = abs(new_yes_price - old_yes_price) * 10000  # Convert to basis points
+        if price_change_bps < MIN_PRICE_CHANGE_BPS:
+            reason = f"Price check: change {price_change_bps:.1f}bps < {MIN_PRICE_CHANGE_BPS}bps threshold"
+            print(f"ENTRY_GUARD: Skipping run - {reason}")
+            return {"_skip_run": True, "skip_reason": reason}
+    
+    # Check 3: New news requirement
+    if REQUIRE_NEW_NEWS:
+        old_news = state.get("news")
+        if old_news is not None and old_news == current_news:
+            reason = "News check: no new news available"
+            print(f"ENTRY_GUARD: Skipping run - {reason}")
+            return {"_skip_run": True, "skip_reason": reason}
+    
+    # All checks passed - clear stale data and proceed
+    print("ENTRY_GUARD: All checks passed, clearing stale data and proceeding")
+    updates["news"] = None
+    updates["market_odds"] = None
     
     return updates
 
@@ -206,6 +349,13 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str]]:
 # ---------------------------------------------------------------------------
 # Edge routing function
 # ---------------------------------------------------------------------------
+
+def route_after_entry_guard(state: AgentState) -> Literal["context", "__end__"]:
+    """Routes after entry guard - skip if checks failed, otherwise continue."""
+    if state.get("_skip_run"):
+        return "__end__"
+    return "context"
+
 
 def route_after_llm(state: AgentState) -> Literal["tools", "__end__"]:
     """Routes the flow based on tool calls or step limit."""
@@ -225,12 +375,14 @@ def route_after_llm(state: AgentState) -> Literal["tools", "__end__"]:
 
 builder = StateGraph(AgentState)
 
+builder.add_node("entry_guard", entry_guard)
 builder.add_node("context", build_context)
 builder.add_node("llm", call_model)
 builder.add_node("tools", ToolNode(TOOLS))
 builder.add_node("apply_updates", apply_updates)
 
-builder.add_edge("__start__", "context")
+builder.add_edge("__start__", "entry_guard")
+builder.add_conditional_edges("entry_guard", route_after_entry_guard)
 builder.add_edge("context", "llm")
 
 # After LLM, decide whether __end__ or tools

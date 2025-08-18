@@ -193,7 +193,12 @@ def get_market_odds() -> dict:
     Output is serialisable so the LLM can read the structure easily.
     """
     odds = _fetch_polymarket_prices()
-    return odds.model_dump()
+    # Convert datetime to ISO string for JSON serialization
+    return {
+        "yes_price": odds.yes_price,
+        "no_price": odds.no_price,
+        "timestamp": odds.timestamp.isoformat()
+    }
 
 
 @tool
