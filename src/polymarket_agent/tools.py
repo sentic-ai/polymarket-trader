@@ -13,7 +13,7 @@ import os
 import random
 import uuid
 from datetime import datetime, timezone
-from typing import List, Literal, cast
+from typing import List, Literal
 
 import requests
 
@@ -24,13 +24,13 @@ except ImportError:
 
 from langchain_core.tools import tool
 
-from .models import MarketOdds, OrderModel, SentimentAnalysisResponse
+from .models import OrderModel, SentimentAnalysisResponse
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
-POLYMARKET_MARKET_ID = os.getenv("POLYMARKET_MARKET_ID", "btc-70k-2025-07-31")
+POLYMARKET_MARKET_ID = os.getenv("POLYMARKET_MARKET_ID", "516713")  # Default to USDT depeg market
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # noqa: S105 — just env var name
 
@@ -38,24 +38,75 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # noqa: S105 — just env var name
 # API helpers (very thin wrappers – keep sync for simplicity)
 # ---------------------------------------------------------------------------
 
-_POLYMARKET_ENDPOINT = "https://www.polymarket.com/api/v3/markets/{}"
+_GAMMA_API_ENDPOINT = "https://gamma-api.polymarket.com/markets"
+
+
+def _fetch_real_market_data(market_id: str) -> dict:
+    """Fetch complete market data from Polymarket Gamma API.
+    
+    Returns market metadata including title, description, prices, volume, etc.
+    """
+    try:
+        resp = requests.get(_GAMMA_API_ENDPOINT, params={"id": market_id}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if not data or len(data) == 0:
+            raise ValueError(f"No market found with ID: {market_id}")
+            
+        market = data[0]  # API returns array, take first result
+        
+        # Parse the data we need
+        # Handle outcomePrices - could be string or array
+        outcome_prices = market["outcomePrices"]
+        if isinstance(outcome_prices, str):
+            # Parse JSON string like "[\"0.055\", \"0.945\"]"
+            import json
+            outcome_prices = json.loads(outcome_prices)
+        
+        return {
+            "id": market["id"],
+            "title": market["question"],
+            "description": market["description"],
+            "end_date": market["endDate"],
+            "yes_price": float(outcome_prices[0]),  # First outcome is YES
+            "no_price": float(outcome_prices[1]),   # Second outcome is NO
+            "volume": float(market["volume"]),
+            "liquidity": float(market["liquidity"]),
+            "active": market["active"],
+            "closed": market["closed"]
+        }
+        
+    except Exception as e:
+        print(f"Failed to fetch real market data for ID {market_id}: {e}")
+        # Return fallback data
+        return {
+            "id": market_id,
+            "title": "Bitcoin to reach $70,000 by July 31, 2025",
+            "description": "Fallback market - API unavailable",
+            "end_date": "2025-07-31T23:59:59Z",
+            "yes_price": 0.5,
+            "no_price": 0.5,
+            "volume": 100000.0,
+            "liquidity": 10000.0,
+            "active": True,
+            "closed": False
+        }
 
 
 def _fetch_polymarket_data() -> dict:
-    """Retrieve market data including YES/NO prices and volume.
-
-    The public Polymarket API returns prices in MILLI-DOLLAR units; we convert
-    to regular USD.
-    """
-    url = _POLYMARKET_ENDPOINT.format(POLYMARKET_MARKET_ID)
+    """Retrieve market data including YES/NO prices and volume using real API."""
     try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = cast(dict, resp.json())
-        # Polymarket returns price in cents; convert to USD
-        yes_price = data["yesPrice"] / 100.0
-        no_price = data["noPrice"] / 100.0
-        volume = data.get("volume", 0)  # Volume in USD
+        # Use the real market data function
+        market_data = _fetch_real_market_data(POLYMARKET_MARKET_ID)
+        
+        return {
+            "yes_price": market_data["yes_price"],
+            "no_price": market_data["no_price"],
+            "volume": market_data["volume"],
+            "timestamp": datetime.now(timezone.utc)
+        }
+        
     except Exception:  # noqa: BLE001 – any failure → fallback to time-based demo data
         # Use current time rounded to 5-minute intervals as seed for consistent data
         now = datetime.now(timezone.utc)
@@ -71,13 +122,13 @@ def _fetch_polymarket_data() -> dict:
         yes_price = round(0.3 + base_price * 0.4, 2)  # 0.3–0.7
         no_price = round(1 - yes_price, 2)
         volume = round(50000 + base_volume * 200000, 2)  # $50K-$250K demo volume
-    
-    return {
-        "yes_price": yes_price,
-        "no_price": no_price,
-        "volume": volume,
-        "timestamp": datetime.now(timezone.utc)
-    }
+        
+        return {
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "volume": volume,
+            "timestamp": datetime.now(timezone.utc)
+        }
 
 
 _NEWS_ENDPOINT = "https://newsapi.org/v2/everything"

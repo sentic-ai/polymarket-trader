@@ -24,7 +24,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .tools import TOOLS, get_market_data, get_news
+from .tools import TOOLS, get_market_data, get_news, _fetch_real_market_data
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -39,9 +39,8 @@ SEC_TIME_BETWEEN_RUNS = int(os.getenv("POLY_AGENT_SEC_TIME_BETWEEN_RUNS", "300")
 REQUIRE_NEW_NEWS = os.getenv("POLY_AGENT_REQUIRE_NEW_NEWS", "true").lower() == "true"
 DEBUG_MODE = os.getenv("POLY_AGENT_DEBUG_MODE", "false").lower() == "true"  # Skip guard rails
 
-MARKET_TITLE = os.getenv("MARKET_TITLE", "Bitcoin to reach $70,000 by September 31, 2025")
-MARKET_DESCRIPTION = os.getenv("MARKET_DESCRIPTION", "This market will resolve to 'Yes' if Bitcoin (BTC) reaches or exceeds $70,000 USD at any point before July 31, 2025, 11:59 PM UTC. Resolution based on CoinGecko price data.")
-MARKET_CLOSING_TIME = os.getenv("MARKET_CLOSING_TIME", "2025-07-31T23:59:59Z")
+# Market ID for fetching real data
+POLYMARKET_MARKET_ID = os.getenv("POLYMARKET_MARKET_ID", "516713")  # Default to USDT depeg market
 
 # ---------------------------------------------------------------------------
 # Graph State Definitions
@@ -93,14 +92,18 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
     last_run_timestamp = state.get("last_run_timestamp", None)
     skip_run = state.get("_skip_run", None)
     history = " | ".join(last_actions) or "(none)"
+    
+    # Fetch real market data
+    market_data = _fetch_real_market_data(POLYMARKET_MARKET_ID)
 
     system_prompt = (
         "You are TraderGPT, an elite AI trading agent specializing in Polymarket prediction markets.\n\n"
     
         f"MARKET CONTEXT:\n"
-        f"Title: {MARKET_TITLE}\n"
-        f"Description: {MARKET_DESCRIPTION}\n"
-        f"Closes: {MARKET_CLOSING_TIME}\n\n"
+        f"Title: {market_data['title']}\n"
+        f"Description: {market_data['description']}\n"
+        f"Closes: {market_data['end_date']}\n"
+        f"Market ID: {market_data['id']}\n\n"
         
         "IDENTITY: You combine quantitative reasoning with market microstructure"
         " awareness and behavioral biases to find non-obvious edges in prediction markets.\n\n"
