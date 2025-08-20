@@ -11,7 +11,7 @@ class OrderModel(BaseModel):
     """Represents a single simulated trade order."""
 
     id: str
-    side: Literal["BUY", "SELL"]
+    side: Literal["BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO"]
     usd_size: float
     price: float
     timestamp: datetime

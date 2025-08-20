@@ -41,8 +41,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # noqa: S105 — just env var name
 _POLYMARKET_ENDPOINT = "https://www.polymarket.com/api/v3/markets/{}"
 
 
-def _fetch_polymarket_prices() -> MarketOdds:
-    """Retrieve YES/NO prices for the configured market.
+def _fetch_polymarket_data() -> dict:
+    """Retrieve market data including YES/NO prices and volume.
 
     The public Polymarket API returns prices in MILLI-DOLLAR units; we convert
     to regular USD.
@@ -55,11 +55,29 @@ def _fetch_polymarket_prices() -> MarketOdds:
         # Polymarket returns price in cents; convert to USD
         yes_price = data["yesPrice"] / 100.0
         no_price = data["noPrice"] / 100.0
-    except Exception:  # noqa: BLE001 – any failure → fallback to random demo prices
-        now = random.random()
-        yes_price = round(0.3 + now * 0.4, 2)  # 0.3–0.7
+        volume = data.get("volume", 0)  # Volume in USD
+    except Exception:  # noqa: BLE001 – any failure → fallback to time-based demo data
+        # Use current time rounded to 5-minute intervals as seed for consistent data
+        now = datetime.now(timezone.utc)
+        # Round to 5-minute intervals: 0, 5, 10, 15, etc.
+        time_slot = (now.hour * 60 + (now.minute // 5) * 5)
+        
+        # Generate consistent data for this 5-minute window
+        random.seed(time_slot)  # Create consistent seed
+        base_price = random.random()
+        base_volume = random.random()
+        random.seed()  # Reset seed for other random operations
+        
+        yes_price = round(0.3 + base_price * 0.4, 2)  # 0.3–0.7
         no_price = round(1 - yes_price, 2)
-    return MarketOdds(yes_price=yes_price, no_price=no_price, timestamp=datetime.now(timezone.utc))
+        volume = round(50000 + base_volume * 200000, 2)  # $50K-$250K demo volume
+    
+    return {
+        "yes_price": yes_price,
+        "no_price": no_price,
+        "volume": volume,
+        "timestamp": datetime.now(timezone.utc)
+    }
 
 
 _NEWS_ENDPOINT = "https://newsapi.org/v2/everything"
@@ -73,12 +91,8 @@ def _fetch_news() -> List[str]:
     purposes.
     """
     if not NEWS_API_KEY:
-        # Demo / offline mode
-        return [
-            "Bitcoin shows resilience after Fed comments",
-            "Analyst predicts BTC surge amid institutional inflows",
-            "Market uncertainty as BTC faces regulatory pressure",
-        ]
+        # Demo / offline mode with time-based rotation
+        return _get_time_based_demo_news()
 
     params = {
         "q": "bitcoin",
@@ -96,11 +110,52 @@ def _fetch_news() -> List[str]:
             raise ValueError("Not enough headlines returned")
         return headlines
     except Exception:  # noqa: BLE001
-        return [
+        return _get_time_based_demo_news()
+
+
+def _get_time_based_demo_news() -> List[str]:
+    """Generate time-based demo news that changes every 5 minutes."""
+    # Use current time rounded to 5-minute intervals as seed
+    now = datetime.now(timezone.utc)
+    time_slot = (now.hour * 60 + (now.minute // 5) * 5)  # 5-minute intervals
+    
+    # Predefined news sets that rotate
+    news_sets = [
+        [
+            "Bitcoin shows resilience after Fed comments",
+            "Analyst predicts BTC surge amid institutional inflows", 
+            "Market uncertainty as BTC faces regulatory pressure",
+        ],
+        [
             "Bitcoin price remains flat in low-volume session",
             "Investors eye ETF approval timeline",
             "Regulatory headwinds could impact crypto adoption",
+        ],
+        [
+            "Major institutional investor adds Bitcoin to portfolio",
+            "Technical analysis suggests BTC breakout imminent",
+            "Mining difficulty adjustment impacts market sentiment",
+        ],
+        [
+            "Central bank digital currencies spark Bitcoin debate",
+            "Whale movements detected on blockchain analytics",
+            "Options expiry creates volatility in BTC markets",
+        ],
+        [
+            "Lightning Network adoption reaches new milestone",
+            "Energy concerns resurface in crypto discussions",
+            "Bitcoin correlation with traditional markets weakens",
+        ],
+        [
+            "DeFi protocols integrate Bitcoin through wrapped tokens",
+            "Geopolitical tensions drive safe haven demand for BTC",
+            "Bitcoin futures open interest hits record levels",
         ]
+    ]
+    
+    # Select news set based on time slot
+    set_index = (time_slot // 5) % len(news_sets)  # Rotate every 5 minutes
+    return news_sets[set_index]
 
 
 # ---------------------------------------------------------------------------
@@ -187,17 +242,18 @@ def _fallback_sentiment(headline: str) -> float:
 # ---------------------------------------------------------------------------
 
 @tool
-def get_market_odds() -> dict:
-    """Return current YES/NO prices.
+def get_market_data() -> dict:
+    """Return current market data including YES/NO prices and trading volume.
 
-    Output is serialisable so the LLM can read the structure easily.
+    Output is serializable so the LLM can read the structure easily.
     """
-    odds = _fetch_polymarket_prices()
+    data = _fetch_polymarket_data()
     # Convert datetime to ISO string for JSON serialization
     return {
-        "yes_price": odds.yes_price,
-        "no_price": odds.no_price,
-        "timestamp": odds.timestamp.isoformat()
+        "yes_price": data["yes_price"],
+        "no_price": data["no_price"], 
+        "volume": data["volume"],
+        "timestamp": data["timestamp"].isoformat()
     }
 
 
@@ -225,21 +281,50 @@ def analyze_sentiment(headlines: List[str]) -> List[dict]:
 
 
 @tool  
-def trade(side: Literal["BUY", "SELL"], usd: float) -> dict:
+def trade(action: Literal["BUY", "SELL"], position: Literal["YES", "NO"], usd: float) -> dict:
     """Execute a trade on the target market.
     
     This tool simulates trade execution and returns the trade details.
-    The apply_updates node will calculate balance/holdings changes.
+    Validation and balance checks are performed in apply_updates.
     
     Parameters:
-    - side: BUY or SELL  
+    - action: BUY or SELL
+    - position: YES or NO (which side to trade)
     - usd: Trade amount in USD
     """
-    odds = _fetch_polymarket_prices()
-    price = odds.yes_price
+    # Basic validation: minimum and maximum trade amounts
+    MIN_TRADE_USD = 1.0
+    MAX_TRADE_USD = 10000.0
+    
+    if usd < MIN_TRADE_USD:
+        return {
+            "tool_name": "trade",
+            "error": f"Trade amount ${usd:.2f} is below minimum of ${MIN_TRADE_USD:.2f}",
+            "success": False
+        }
+    
+    if usd > MAX_TRADE_USD:
+        return {
+            "tool_name": "trade", 
+            "error": f"Trade amount ${usd:.2f} exceeds maximum of ${MAX_TRADE_USD:.2f}",
+            "success": False
+        }
+    
+    market_data = _fetch_polymarket_data()
+    yes_price = market_data["yes_price"] 
+    no_price = market_data["no_price"]
     timestamp = datetime.now(timezone.utc)
     
+    # Determine which price to use based on position
+    if position == "YES":
+        price = yes_price
+    else:  # NO
+        price = no_price
+    
     contracts = usd / price
+    
+    # Create combined side for backwards compatibility
+    side = f"{action}_{position}"
     
     order = OrderModel(
         id=str(uuid.uuid4()),
@@ -256,14 +341,15 @@ def trade(side: Literal["BUY", "SELL"], usd: float) -> dict:
             "side": order.side,
             "usd_size": order.usd_size,
             "price": order.price,
-            "timestamp": order.timestamp.isoformat()  # Convert datetime to JSON-serializable string
+            "timestamp": order.timestamp.isoformat()
         },
         "side": side,
         "usd_amount": usd,
         "price": price,
         "contracts": contracts,
-        "action_summary": f"{side} ${usd:.2f} @ {price:.2f}"
+        "action_summary": f"{side} ${usd:.2f} @ {price:.2f}",
+        "success": True
     }
 
 
-TOOLS = [get_market_odds, get_news, analyze_sentiment, trade]
+TOOLS = [get_market_data, get_news, analyze_sentiment, trade]

@@ -24,7 +24,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .tools import TOOLS, get_market_odds, get_news
+from .tools import TOOLS, get_market_data, get_news
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,6 +37,11 @@ MAX_TOOL_STEPS = int(os.getenv("POLY_AGENT_MAX_STEPS", "6"))
 MIN_PRICE_CHANGE_BPS = int(os.getenv("POLY_AGENT_MIN_PRICE_CHANGE_BPS", "25"))  # 0.25%
 SEC_TIME_BETWEEN_RUNS = int(os.getenv("POLY_AGENT_SEC_TIME_BETWEEN_RUNS", "300"))  # 5 minutes
 REQUIRE_NEW_NEWS = os.getenv("POLY_AGENT_REQUIRE_NEW_NEWS", "true").lower() == "true"
+DEBUG_MODE = os.getenv("POLY_AGENT_DEBUG_MODE", "false").lower() == "true"  # Skip guard rails
+
+MARKET_TITLE = os.getenv("MARKET_TITLE", "Bitcoin to reach $70,000 by September 31, 2025")
+MARKET_DESCRIPTION = os.getenv("MARKET_DESCRIPTION", "This market will resolve to 'Yes' if Bitcoin (BTC) reaches or exceeds $70,000 USD at any point before July 31, 2025, 11:59 PM UTC. Resolution based on CoinGecko price data.")
+MARKET_CLOSING_TIME = os.getenv("MARKET_CLOSING_TIME", "2025-07-31T23:59:59Z")
 
 # ---------------------------------------------------------------------------
 # Graph State Definitions
@@ -49,10 +54,11 @@ class AgentState(TypedDict, total=False):
     - ``messages``: Conversation history (System, Human, AI, Tool)
     - ``step``:     How many tool steps have been executed?
     - ``balance``:  Current USD balance
-    - ``holdings``: Number of YES-contracts held
+    - ``yes_holdings``: Number of YES-contracts held
+    - ``no_holdings``: Number of NO-contracts held
     - ``last_5_actions``: Recent trading actions history
     - ``news``: Latest news headlines from get_news tool
-    - ``market_odds``: Latest market odds from get_market_odds tool
+    - ``market_odds``: Latest market odds from get_market_data tool
     - ``last_run_timestamp``: Timestamp of last completed run
     - ``_skip_run``: Internal flag to skip run (set by entry_guard)
     - ``skip_reason``: Reason why run was skipped (if applicable)
@@ -61,7 +67,8 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], add_messages]
     step: int
     balance: float
-    holdings: float
+    yes_holdings: float
+    no_holdings: float
     last_5_actions: List[str]
     news: Optional[List[str]]
     market_odds: Optional[Dict[str, float]]
@@ -75,9 +82,11 @@ class AgentState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 
 def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | List[str] | datetime | bool | None]:
+    print(f"CONTEXT: Starting context node at {datetime.now(tz=UTC).strftime('%H:%M:%S')}")
     """Creates the initial prompt based on persistent state."""
     balance = state.get("balance", 1000.0)
-    holdings = state.get("holdings", 0.0) 
+    yes_holdings = state.get("yes_holdings", 0.0)
+    no_holdings = state.get("no_holdings", 0.0)
     last_actions = state.get("last_5_actions", [])
     news = state.get("news", None)
     market_odds = state.get("market_odds", None)
@@ -88,9 +97,18 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
     system_prompt = (
         "You are TraderGPT, an elite AI trading agent specializing in Polymarket prediction markets.\n\n"
     
-    "IDENTITY: You combine quantitative analysis with geopolitical insight, behavioral economics, "
-    "and information asymmetry detection to find alpha in prediction markets.\n\n"
-    
+        f"MARKET CONTEXT:\n"
+        f"Title: {MARKET_TITLE}\n"
+        f"Description: {MARKET_DESCRIPTION}\n"
+        f"Closes: {MARKET_CLOSING_TIME}\n\n"
+        
+        "IDENTITY: You combine quantitative reasoning with market microstructure"
+        " awareness and behavioral biases to find non-obvious edges in prediction markets.\n\n"
+    "Inputs to value in your trading decision:\n\n"
+    "   - Balance (USD)\n"
+    "   - Holdings on both sides (YES shares, NO shares)\n"
+    "   - Market odds and trading volume\n"
+    "   - Your last 5 trades\n\n"
     "CORE STRATEGY FRAMEWORK:\n"
     "1. INFORMATION EDGE: Identify what the market is missing\n"
     "   - Detect narrative shifts before they're priced in\n"
@@ -101,51 +119,49 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
     "   - Recency bias: Markets overweight recent events\n"
     "   - Availability heuristic: Vivid news gets overpriced\n"
     "   - Herd behavior: Identify crowded trades to fade\n"
-    "   - Anchoring: Markets slow to update from initial odds\n\n"
-    
-    "3. ADVANCED TACTICS:\n"
-    "   - MOMENTUM PLAY: Ride trends with strong catalysts\n"
-    "   - MEAN REVERSION: Fade extreme moves without fundamental basis\n"
-    "   - VOLATILITY ARBITRAGE: Buy underpriced uncertainty\n"
-    "   - EVENT CATALYST: Position before predictable news flow\n"
-    "   - CORRELATION TRADE: Exploit mispricing across related markets\n\n"
     
     "4. RISK MANAGEMENT:\n"
-    "   - Kelly Criterion sizing: Bet size proportional to edge\n"
-    "   - Never risk more than 25% on single high-conviction play\n"
-    "   - Scale into positions: 30% initial, add on confirmation\n"
-    "   - Cut losses at -15% unless thesis remains intact\n\n"
+    "   - Per trade sizing MUST obey: size_usd ≤ 25% of available cash.\n"
+    
+    "TRADING OPTIONS:\n"
+    "- BUY + YES: Buy YES contracts (bet outcome will happen)\n"
+    "- BUY + NO: Buy NO contracts (bet outcome won't happen)\n"
+    "- SELL + YES: Sell your YES contracts (if you own any)\n"
+    "- SELL + NO: Sell your NO contracts (if you own any)\n\n"
     
     "TRADING SIGNALS (Combine multiple for conviction):\n"
-    "- STRONG BUY: 3+ bullish signals, <40% market odds, high conviction\n"
-    "- BUY: Information asymmetry detected, market lagging narrative\n"
-    "- SELL: Euphoria detected, odds >80% on weak fundamentals\n"
-    "- SHORT: Crowd psychology at extremes, catalyst for reversal\n"
+    "- BUY_YES: Information asymmetry detected, market underpricing YES\n"
+    "- BUY_NO: Euphoria detected, YES odds >80% on weak fundamentals\n"
+    "- SELL: Take profits or cut losses on existing positions\n"
     "- HOLD: Mixed signals or fair value\n\n"
     
     "DECISION FRAMEWORK:\n"
-    "1. Scan market odds vs. your Bayesian prior\n"
+    "1. Scan market odds\n"
     "2. Analyze news for:\n"
     "   - What's priced in vs. what's new information\n"
     "   - Second-order effects markets might miss\n"
     "   - Sentiment extremes to fade\n"
     "3. Identify the market's blind spot\n"
+    "4. Position Contex - Your own book matters:\n"
+    "   - Factor your past trades, holding, timing into your decision\n"
     "4. Size position based on:\n"
     "   - Conviction level (1-10 scale)\n"
     "   - Risk/reward asymmetry\n"
-    "   - Current exposure\n\n"
+    "   - Current holdings, past trades\n\n"
     
     "OUTPUT FORMAT:\n"
     "🎯 THESIS: [One-line insight the market is missing]\n"
     "📊 EDGE: [Specific mispricing or behavioral bias to exploit]\n"
     "🎲 CONVICTION: [X/10]\n"
-    "💰 ACTION: [BUY/SELL X% of capital]\n"
+    "💰 ACTION: [BUY/SELL + YES/NO X% of capital]\n"
     "📈 TARGET: [Expected odds in X timeframe]\n\n"
     
     "Remember: The best trades are contrarian with a catalyst. Don't just follow news—find "
     "what others overlook. Your reputation depends on making non-obvious, profitable calls."
 
-        "You have up to 6 tool calls. End with your final decision."
+        "You have up to 6 tool calls. End with your final decision.\n\n"
+        "CRITICAL: When you decide to trade, you MUST actually call the trade(action='BUY'/'SELL', position='YES'/'NO', usd=amount) tool. "
+        "Do not just say you will trade - execute it by calling the tool!"
     )
     system_msg = SystemMessage(content=system_prompt)
 
@@ -153,8 +169,9 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
         content=(
             f"Current UTC: {datetime.now(tz=UTC).isoformat()}\n"
             f"Balance: ${balance:.2f}\n"
-            f"Holdings: {holdings:.4f} YES-contracts\n"
-            f"Last actions: {history}"
+            f"YES Holdings: {yes_holdings:.4f} contracts\n"
+            f"NO Holdings: {no_holdings:.4f} contracts\n"
+            f"Last Trades: {history}"
         )
     )
     result = {
@@ -165,8 +182,10 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
     # Only set defaults if these values don't exist in state (first run)
     if "balance" not in state:
         result["balance"] = balance
-    if "holdings" not in state:
-        result["holdings"] = holdings  
+    if "yes_holdings" not in state:
+        result["yes_holdings"] = yes_holdings
+    if "no_holdings" not in state:
+        result["no_holdings"] = no_holdings
     if "last_5_actions" not in state:
         result["last_5_actions"] = last_actions
     if "news" not in state:
@@ -194,8 +213,21 @@ def call_model(state: AgentState) -> Dict[str, List[AIMessage] | int]:
     """Calls the LLM synchronously and returns the AIMessage."""
 
     llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0).bind_tools(TOOLS)
+    
+    # Debug: Check what tools are available
+    print(f"DEBUG: Available tools: {[tool.name for tool in TOOLS]}")
 
     response = llm.invoke(state["messages"])
+    
+    # Debug: Check if LLM tried to make tool calls
+    if hasattr(response, 'tool_calls'):
+        print(f"DEBUG: LLM tool calls: {len(response.tool_calls)}")
+        for call in response.tool_calls:
+            print(f"  - Tool: {call.get('name', 'unknown')}, Args: {call.get('args', {})}")
+    if hasattr(response, 'invalid_tool_calls'):
+        print(f"DEBUG: Invalid tool calls: {len(response.invalid_tool_calls)}")
+        for call in response.invalid_tool_calls:
+            print(f"  - Invalid: {call}")
     
     # Increment step if we just processed tool results
     new_step = state["step"]
@@ -220,11 +252,24 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, 
     if not state.get("messages"):
         return updates
     
-    # Process ALL ToolMessages from the most recent tool execution batch
-    # We need to process all tool results, not just the last one
-    for message in reversed(state["messages"]):
-        if not (hasattr(message, 'type') and message.type == 'tool'):
-            continue
+    # Process ONLY ToolMessages from the most recent tool execution batch
+    # Find the most recent AI message and process tool results that come after it
+    last_ai_index = -1
+    for i in range(len(state["messages"]) - 1, -1, -1):
+        msg = state["messages"][i]
+        if hasattr(msg, 'type') and msg.type == 'ai':
+            last_ai_index = i
+            break
+    
+    # Process only tool messages that come after the last AI message
+    recent_tool_messages = []
+    if last_ai_index >= 0:
+        for i in range(last_ai_index + 1, len(state["messages"])):
+            msg = state["messages"][i]
+            if hasattr(msg, 'type') and msg.type == 'tool':
+                recent_tool_messages.append(msg)
+    
+    for message in recent_tool_messages:
             
         tool_name = getattr(message, 'name', '')
         tool_content = message.content
@@ -244,32 +289,72 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, 
         
         # Process different tool results - don't break, continue processing all tools
         if tool_name == 'trade':
-            # Process trade tool result (existing logic)
+            # Process trade tool result with validation
             if result and isinstance(result, dict) and result.get('tool_name') == 'trade':
-                side = result.get('side')
-                usd_amount = result.get('usd_amount', 0)
-                price = result.get('price', 1)
-                
-                current_balance = state.get('balance', 1000.0)
-                current_holdings = state.get('holdings', 0.0)
-                
-                # Calculate state updates based on trade
-                if side == 'BUY':
-                    actual_usd = min(usd_amount, current_balance)
-                    actual_contracts = actual_usd / price
-                    updates['balance'] = current_balance - actual_usd
-                    updates['holdings'] = current_holdings + actual_contracts
-                elif side == 'SELL':
-                    max_sellable_usd = current_holdings * price
-                    actual_usd = min(usd_amount, max_sellable_usd)
-                    actual_contracts = actual_usd / price
-                    updates['balance'] = current_balance + actual_usd
-                    updates['holdings'] = current_holdings - actual_contracts
-                
-                # Update action history
-                if 'action_summary' in result:
+                # Check if trade was successful at tool level (min/max validation)
+                if result.get('success', True):  # Default to True for backward compatibility
+                    side = result.get('side')
+                    usd_amount = result.get('usd_amount', 0)
+                    price = result.get('price', 1)
+                    
+                    current_balance = state.get('balance', 1000.0)
+                    current_yes_holdings = state.get('yes_holdings', 0.0)
+                    current_no_holdings = state.get('no_holdings', 0.0)
+                    
+                    # Additional validation: sufficient balance/holdings
+                    trade_valid = True
+                    error_msg = ""
+                    
+                    if side in ['BUY_YES', 'BUY_NO']:
+                        # For buying, check if we have sufficient balance
+                        if usd_amount > current_balance:
+                            trade_valid = False
+                            error_msg = f"Insufficient balance: ${current_balance:.2f} available, ${usd_amount:.2f} requested"
+                    elif side == 'SELL_YES':
+                        # For selling YES, check if we have enough YES contracts
+                        max_sellable_usd = current_yes_holdings * price
+                        if usd_amount > max_sellable_usd:
+                            trade_valid = False
+                            error_msg = f"Insufficient YES holdings: ${max_sellable_usd:.2f} worth available, ${usd_amount:.2f} requested"
+                    elif side == 'SELL_NO':
+                        # For selling NO, check if we have enough NO contracts
+                        max_sellable_usd = current_no_holdings * price
+                        if usd_amount > max_sellable_usd:
+                            trade_valid = False
+                            error_msg = f"Insufficient NO holdings: ${max_sellable_usd:.2f} worth available, ${usd_amount:.2f} requested"
+                    
+                    if trade_valid:
+                        # Execute the trade - update balance and appropriate holdings
+                        contracts = usd_amount / price
+                        
+                        if side == 'BUY_YES':
+                            updates['balance'] = current_balance - usd_amount
+                            updates['yes_holdings'] = current_yes_holdings + contracts
+                        elif side == 'BUY_NO':
+                            updates['balance'] = current_balance - usd_amount
+                            updates['no_holdings'] = current_no_holdings + contracts
+                        elif side == 'SELL_YES':
+                            updates['balance'] = current_balance + usd_amount
+                            updates['yes_holdings'] = current_yes_holdings - contracts
+                        elif side == 'SELL_NO':
+                            updates['balance'] = current_balance + usd_amount
+                            updates['no_holdings'] = current_no_holdings - contracts
+                        
+                        # Update action history for successful trades
+                        if 'action_summary' in result:
+                            current_actions = state.get('last_5_actions', [])
+                            new_actions = (current_actions + [result['action_summary']])[-5:]
+                            updates['last_5_actions'] = new_actions
+                    else:
+                        # Trade failed validation - add error to action history
+                        current_actions = state.get('last_5_actions', [])
+                        new_actions = (current_actions + [f"FAILED: {error_msg}"])[-5:]
+                        updates['last_5_actions'] = new_actions
+                else:
+                    # Trade failed at tool level - add error to action history
+                    error_msg = result.get('error', 'Trade failed')
                     current_actions = state.get('last_5_actions', [])
-                    new_actions = (current_actions + [result['action_summary']])[-5:]
+                    new_actions = (current_actions + [f"FAILED: {error_msg}"])[-5:]
                     updates['last_5_actions'] = new_actions
         
         elif tool_name == 'get_news':
@@ -277,7 +362,7 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, 
             if isinstance(result, list):
                 updates['news'] = result
         
-        elif tool_name == 'get_market_odds':
+        elif tool_name == 'get_market_data':
             # Process market odds tool result
             if isinstance(result, dict):
                 updates['market_odds'] = result
@@ -301,22 +386,35 @@ def entry_guard(state: AgentState) -> Dict[str, List[str] | Dict[str, float] | d
     3. New news requirement
     
     If any check fails, routes to end. Otherwise clears stale data.
+    DEBUG_MODE skips all checks.
     """
     now = datetime.now(tz=UTC)
     updates = {}
     
+    print(f"ENTRY_GUARD: Starting checks at {now.strftime('%H:%M:%S')}")
+    
+    # DEBUG MODE: Skip all checks
+    if DEBUG_MODE:
+        print("ENTRY_GUARD: DEBUG_MODE enabled - skipping all checks")
+        updates["_skip_run"] = False
+        print(f"ENTRY_GUARD: Returning updates: {updates}")
+        return updates
+    
     # Get current market data and news (without storing in state)
-    current_market_odds = get_market_odds.invoke({})
+    current_market_odds = get_market_data.invoke({})
     current_news = get_news.invoke({})
     
     # Check 1: Time between runs
     last_run = state.get("last_run_timestamp")
     if last_run is not None:
         time_since_last = (now - last_run).total_seconds()
+        print(f"ENTRY_GUARD: Time since last run: {time_since_last:.0f}s (need {SEC_TIME_BETWEEN_RUNS}s)")
         if time_since_last < SEC_TIME_BETWEEN_RUNS:
             reason = f"Time check: only {time_since_last:.0f}s since last run (need {SEC_TIME_BETWEEN_RUNS}s)"
             print(f"ENTRY_GUARD: Skipping run - {reason}")
             return {"_skip_run": True, "skip_reason": reason}
+    else:
+        print("ENTRY_GUARD: No previous run timestamp - time check passed")
     
     # Check 2: Price change threshold
     old_market_odds = state.get("market_odds")
@@ -325,24 +423,35 @@ def entry_guard(state: AgentState) -> Dict[str, List[str] | Dict[str, float] | d
         new_yes_price = current_market_odds.get("yes_price", 0)
         
         price_change_bps = abs(new_yes_price - old_yes_price) * 10000  # Convert to basis points
+        print(f"ENTRY_GUARD: Price change: {old_yes_price} → {new_yes_price} ({price_change_bps:.1f}bps, need {MIN_PRICE_CHANGE_BPS}bps)")
         if price_change_bps < MIN_PRICE_CHANGE_BPS:
             reason = f"Price check: change {price_change_bps:.1f}bps < {MIN_PRICE_CHANGE_BPS}bps threshold"
             print(f"ENTRY_GUARD: Skipping run - {reason}")
             return {"_skip_run": True, "skip_reason": reason}
+    else:
+        print("ENTRY_GUARD: No previous market odds - price check skipped")
     
     # Check 3: New news requirement
     if REQUIRE_NEW_NEWS:
         old_news = state.get("news")
-        if old_news is not None and old_news == current_news:
-            reason = "News check: no new news available"
-            print(f"ENTRY_GUARD: Skipping run - {reason}")
-            return {"_skip_run": True, "skip_reason": reason}
+        if old_news is not None:
+            news_changed = old_news != current_news
+            print(f"ENTRY_GUARD: News changed: {news_changed}")
+            if not news_changed:
+                reason = "News check: no new news available"
+                print(f"ENTRY_GUARD: Skipping run - {reason}")
+                return {"_skip_run": True, "skip_reason": reason}
+        else:
+            print("ENTRY_GUARD: No previous news - news check skipped")
+    else:
+        print("ENTRY_GUARD: News requirement disabled")
     
     # All checks passed - clear stale data and proceed
     print("ENTRY_GUARD: All checks passed, clearing stale data and proceeding")
-    updates["news"] = None
-    updates["market_odds"] = None
+    # Clear the _skip_run flag from previous runs
+    updates["_skip_run"] = False
     
+    print(f"ENTRY_GUARD: Returning updates: {updates}")
     return updates
 
 
@@ -352,8 +461,12 @@ def entry_guard(state: AgentState) -> Dict[str, List[str] | Dict[str, float] | d
 
 def route_after_entry_guard(state: AgentState) -> Literal["context", "__end__"]:
     """Routes after entry guard - skip if checks failed, otherwise continue."""
-    if state.get("_skip_run"):
+    skip_run = state.get("_skip_run")
+    print(f"ROUTING: _skip_run = {skip_run}")
+    if skip_run:
+        print("ROUTING: Going to __end__")
         return "__end__"
+    print("ROUTING: Going to context")
     return "context"
 
 
