@@ -24,7 +24,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .tools import TOOLS, get_market_data, get_news, _fetch_real_market_data
+from .tools import TOOLS, get_market_data, get_news, _fetch_real_market_data, _increment_url_usage
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,6 +61,7 @@ class AgentState(TypedDict, total=False):
     - ``last_run_timestamp``: Timestamp of last completed run
     - ``_skip_run``: Internal flag to skip run (set by entry_guard)
     - ``skip_reason``: Reason why run was skipped (if applicable)
+    - ``news_usage_cache``: Cache of news URLs with usage counts
     """
 
     messages: Annotated[List[BaseMessage], add_messages]
@@ -74,6 +75,7 @@ class AgentState(TypedDict, total=False):
     last_run_timestamp: Optional[datetime]
     _skip_run: Optional[bool]
     skip_reason: Optional[str]
+    news_usage_cache: Optional[Dict[str, int]]
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +123,20 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
     "2. MARKET PSYCHOLOGY: Exploit behavioral biases\n"
     "   - Recency bias: Markets overweight recent events\n"
     "   - Availability heuristic: Vivid news gets overpriced\n"
-    "   - Herd behavior: Identify crowded trades to fade\n"
+    "   - Herd behavior: Identify crowded trades to fade\n\n"
     
-    "4. RISK MANAGEMENT:\n"
-    "   - Per trade sizing MUST obey: size_usd ≤ 25% of available cash.\n"
+    "3. RISK MANAGEMENT:\n"
+    "   - Per-trade sizing MUST obey: size_usd ≤ 15% of available cash.\n"
+    "   - 15% is a absolut hard ceiling, not a default. Size your trades 0-15% of available cash\n"
+    "   - SIZE EXAMPLES:\n"
+    "     • Conviction 9-10/10 + HIGH impact: 10-15%\n"
+    "     • Conviction 7-8/10 + MEDIUM impact: 5-10%\n"
+    "     • Conviction 5-6/10 + LOW impact: 1-3%\n"
+    "   - Incorporate your current book: avoid adding risk to an already crowded side;\n"
+    "   - Start small; prefer HOLD or a small probe when signals are mixed or weak."
+    "   - Choose the smallest trade size that clearly expresses your view; \n"
+    "   - If the intended action conflicts with your existing exposure (e.g., want to buy NO while holding YES), consider selling/reducing the opposing side.\n"
+    "   - Never justify size by 'adheres to 15%'; justify by evidence (sources + microstructure + your current book).\n"
     
     "TRADING OPTIONS:\n"
     "- BUY + YES: Buy YES contracts (bet outcome will happen)\n"
@@ -141,26 +153,31 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
     "DECISION FRAMEWORK:\n"
     "1. Scan market odds\n"
     "2. Analyze news for:\n"
+    "   - Ignore generic news/unrelated news/spam\n"
     "   - What's priced in vs. what's new information\n"
     "   - Second-order effects markets might miss\n"
     "   - Sentiment extremes to fade\n"
     "3. Identify the market's blind spot\n"
-    "4. Position Contex - Your own book matters:\n"
-    "   - Factor your past trades, holding, timing into your decision\n"
+    "4. Position Context - Your own book matters:\n"
+    "   - Factor your past trades, holdings, and timing into your decision.\n"
     "4. Size position based on:\n"
     "   - Conviction level (1-10 scale)\n"
     "   - Risk/reward asymmetry\n"
     "   - Current holdings, past trades\n\n"
-    
+    "   - Use current holdings, average entry, and last 5 trades to decide whether to add, reduce, or flip rather than initiate a fresh opposite-side add.\n"
+"   - If signals are mixed relative to your book, prefer HOLD or reduce instead of forcing a new position.\n"
+
     "OUTPUT FORMAT:\n"
-    "🎯 THESIS: [One-line insight the market is missing]\n"
+    "🎯 THESIS: [1-2 sentence insight the market is missing]\n"
     "📊 EDGE: [Specific mispricing or behavioral bias to exploit]\n"
     "🎲 CONVICTION: [X/10]\n"
     "💰 ACTION: [BUY/SELL + YES/NO X% of capital]\n"
     "📈 TARGET: [Expected odds in X timeframe]\n\n"
+    "🔎 SIZING RATIONALE: [one line explaining why this size is justified given sources, microstructure, and your current book]\n"
+
     
     "Remember: The best trades are contrarian with a catalyst. Don't just follow news—find "
-    "what others overlook. Your reputation depends on making non-obvious, profitable calls."
+    "what others overlook. Your reputation depends on making non-obvious, profitable calls.\n\n"
 
         "You have up to 6 tool calls. End with your final decision.\n\n"
         "CRITICAL: When you decide to trade, you MUST actually call the trade(action='BUY'/'SELL', position='YES'/'NO', usd=amount) tool. "
@@ -199,6 +216,8 @@ def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | Li
         result["last_run_timestamp"] = last_run_timestamp
     if "_skip_run" not in state:
         result["_skip_run"] = skip_run
+    if "news_usage_cache" not in state:
+        result["news_usage_cache"] = {}
         
     return result
 
@@ -214,6 +233,11 @@ def _is_last_step(step: int) -> bool:
 
 def call_model(state: AgentState) -> Dict[str, List[AIMessage] | int]:
     """Calls the LLM synchronously and returns the AIMessage."""
+
+    # Set up news cache for the get_news tool
+    current_cache = state.get('news_usage_cache', {})
+    get_news._usage_cache = current_cache
+    print(f"DEBUG: Set news cache with {len(current_cache)} URLs")
 
     llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0).bind_tools(TOOLS)
     
@@ -361,9 +385,17 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, 
                     updates['last_5_actions'] = new_actions
         
         elif tool_name == 'get_news':
-            # Process news tool result
-            if isinstance(result, list):
+            # Process news tool result and update usage cache
+            if isinstance(result, list) and len(result) > 0:
                 updates['news'] = result
+                
+                # Update news usage cache for the returned news item
+                news_item = result[0]  # Should be exactly one item
+                if isinstance(news_item, dict) and 'url' in news_item:
+                    current_cache = state.get('news_usage_cache', {})
+                    updated_cache = _increment_url_usage(current_cache, news_item['url'])
+                    updates['news_usage_cache'] = updated_cache
+                    print(f"DEBUG: Updated news cache, URL {news_item['url']} now used {updated_cache.get(news_item['url'], 1)} times")
         
         elif tool_name == 'get_market_data':
             # Process market odds tool result
@@ -405,7 +437,8 @@ def entry_guard(state: AgentState) -> Dict[str, List[str] | Dict[str, float] | d
     
     # Get current market data and news (without storing in state)
     current_market_odds = get_market_data.invoke({})
-    current_news = get_news.invoke({})
+    # For entry_guard, we don't need to pass cache since we're just checking for changes
+    current_news = get_news.invoke({"search_query": "latest market news"})
     
     # Check 1: Time between runs
     last_run = state.get("last_run_timestamp")

@@ -73,3 +73,26 @@ class SentimentAnalysisResponse(BaseModel):
         ge=0.0,
         le=1.0
     )
+
+
+class MarketImpactAnalysis(BaseModel):
+    """Analysis of how news impacts the likelihood of market outcome."""
+    
+    direction: Literal["INCREASES_YES", "INCREASES_NO", "NEUTRAL"] = Field(
+        description="How the news affects the probability of the market outcome"
+    )
+    impact: Literal["LOW", "MEDIUM", "HIGH"] = Field(
+        description="Magnitude of the impact on market outcome"
+    )
+    confidence: float = Field(
+        description="Confidence in the analysis (0.0 to 1.0)",
+        ge=0.0,
+        le=1.0
+    )
+    reasoning: str = Field(
+        description="Brief explanation of the analysis (1-2 sentences)",
+        max_length=200
+    )
+    news_urls: List[str] = Field(
+        description="URLs of the news sources analyzed"
+    )

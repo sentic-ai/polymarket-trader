@@ -11,11 +11,17 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import uuid
 from datetime import datetime, timezone
-from typing import List, Literal
+from typing import Dict, List, Literal
 
 import requests
+
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None
 
 try:
     from langchain_openai import ChatOpenAI
@@ -24,15 +30,119 @@ except ImportError:
 
 from langchain_core.tools import tool
 
-from .models import OrderModel, SentimentAnalysisResponse
+from .models import OrderModel, SentimentAnalysisResponse, MarketImpactAnalysis
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
 POLYMARKET_MARKET_ID = os.getenv("POLYMARKET_MARKET_ID", "516713")  # Default to USDT depeg market
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+
+# News caching configuration
+MAX_CACHED_URLS = 100
+MAX_USAGE_COUNT = 30
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # Legacy NewsAPI (not used anymore)
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # noqa: S105 — just env var name
+
+# Global market context cache
+_CURRENT_MARKET_CONTEXT = None
+
+# ---------------------------------------------------------------------------
+# Cache management helpers
+# ---------------------------------------------------------------------------
+
+def _manage_news_cache(cache: Dict[str, int]) -> Dict[str, int]:
+    """Clean up news usage cache based on limits.
+    
+    Args:
+        cache: Current cache dict {url: usage_count}
+        
+    Returns:
+        Cleaned cache dict
+    """
+    if not cache:
+        return cache
+        
+    # If ANY URL hits max usage count, clear entire cache
+    if any(count > MAX_USAGE_COUNT for count in cache.values()):
+        print(f"DEBUG: Max usage count ({MAX_USAGE_COUNT}) reached, clearing entire news cache")
+        return {}
+    
+    # If cache exceeds max URLs, clear entire cache
+    if len(cache) > MAX_CACHED_URLS:
+        print(f"DEBUG: Max cached URLs ({MAX_CACHED_URLS}) reached, clearing entire news cache")
+        return {}
+    
+    return cache
+
+
+def _increment_url_usage(cache: Dict[str, int], url: str) -> Dict[str, int]:
+    """Increment usage count for a URL in the cache.
+    
+    Args:
+        cache: Current cache dict
+        url: URL to increment
+        
+    Returns:
+        Updated cache dict
+    """
+    new_cache = cache.copy()
+    new_cache[url] = new_cache.get(url, 0) + 1
+    return _manage_news_cache(new_cache)
+
+
+def _clean_text_content(text: str) -> str:
+    """Remove ANSI escape codes and clean up text content.
+    
+    Args:
+        text: Raw text that might contain ANSI codes
+        
+    Returns:
+        Cleaned text without escape codes
+    """
+    if not text:
+        return text
+        
+    # Remove ANSI escape codes (like \x1b[0m, \x1b[31m, etc.)
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+    cleaned = ansi_escape.sub('', text)
+    
+    # Remove other common escape sequences
+    cleaned = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', cleaned)
+    
+    # Clean up extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
+
+
+def _get_market_context() -> Dict[str, str]:
+    """Get cached market context or fetch if not available.
+    
+    Returns:
+        Dict with 'title' and 'description' of current market
+    """
+    global _CURRENT_MARKET_CONTEXT
+    
+    if _CURRENT_MARKET_CONTEXT is None:
+        try:
+            market_data = _fetch_real_market_data(POLYMARKET_MARKET_ID)
+            _CURRENT_MARKET_CONTEXT = {
+                'title': market_data['title'],
+                'description': market_data['description']
+            }
+            print(f"DEBUG: Cached market context for market: {market_data['title']}")
+        except Exception as e:
+            print(f"DEBUG: Failed to fetch market context: {e}")
+            # Fallback context
+            _CURRENT_MARKET_CONTEXT = {
+                'title': 'Unknown Market',
+                'description': 'Market context unavailable'
+            }
+    
+    return _CURRENT_MARKET_CONTEXT
+
 
 # ---------------------------------------------------------------------------
 # API helpers (very thin wrappers – keep sync for simplicity)
@@ -131,110 +241,281 @@ def _fetch_polymarket_data() -> dict:
         }
 
 
-_NEWS_ENDPOINT = "https://newsapi.org/v2/everything"
 
 
-def _fetch_news() -> List[str]:
-    """Fetch top Bitcoin headlines and return them raw (no scoring).
+def _fetch_news(search_query: str = "general", usage_cache: Dict[str, int] = None) -> List[dict]:
+    """Fetch structured news data and return single best unused news item.
 
-    The function always returns **exactly** three headlines. In case of any
-    network or API error a deterministic stub list is returned for demo / test
-    purposes.
+    The function returns exactly one news item in a list. Uses Tavily if API key
+    is available, otherwise falls back to time-based demo news.
+    
+    Args:
+        search_query: Search query or question to execute with Tavily
+        usage_cache: Dict of URL -> usage_count for avoiding duplicates
     """
-    if not NEWS_API_KEY:
-        # Demo / offline mode with time-based rotation
-        return _get_time_based_demo_news()
+    if usage_cache is None:
+        usage_cache = {}
+        
+    # Try Tavily first if API key is available
+    if TAVILY_API_KEY and TavilyClient:
+        try:
+            tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+            response = tavily_client.search(search_query, search_depth="advanced", time_range="week", max_results=15)
+            if response and 'results' in response:
+                # Parse all results with scores
+                all_news = []
+                for result in response['results']:
+                    title = result.get('title', '').strip()
+                    content = result.get('content', '').strip()
+                    url = result.get('url', '').strip()
+                    score = result.get('score', 0.0)
+                    
+                    if title and len(title) > 10 and url:
+                        # Clean title and content from ANSI escape codes
+                        clean_title = _clean_text_content(title)
+                        clean_content = _clean_text_content(content)
+                        
+                        # Truncate content after cleaning
+                        if len(clean_content) > 500:
+                            clean_content = clean_content[:500] + '...'
+                        
+                        all_news.append({
+                            'title': clean_title,
+                            'content': clean_content,
+                            'url': url,
+                            'score': score
+                        })
+                
+                if all_news:
+                    # Filter by relevance score >= 0.4, but ensure at least top 5
+                    high_relevance = [item for item in all_news if item['score'] >= 0.4]
+                    if len(high_relevance) < 5:
+                        # Take top 5 by score regardless of threshold
+                        filtered_news = sorted(all_news, key=lambda x: x['score'], reverse=True)[:5]
+                    else:
+                        filtered_news = high_relevance
+                    
+                    # Find best item to use (unused or lowest usage count)
+                    selected_item = None
+                    min_usage = float('inf')
+                    
+                    for item in filtered_news:
+                        usage_count = usage_cache.get(item['url'], 0)
+                        if usage_count == 0:  # Unused item found
+                            selected_item = item
+                            break
+                        elif usage_count < min_usage:  # Track lowest usage
+                            min_usage = usage_count
+                            selected_item = item
+                    
+                    if selected_item:
+                        # Remove score from final output
+                        final_item = {k: v for k, v in selected_item.items() if k != 'score'}
+                        return [final_item]
+                    
+        except Exception as e:
+            print(f"Tavily search failed, using fallback: {e}")
+    
+    # Fallback to time-based demo news (return first item only)
+    fallback_news = _get_time_based_demo_news()
+    return [fallback_news[0]] if fallback_news else []
 
-    params = {
-        "q": "bitcoin",
-        "language": "en",
-        "sortBy": "relevancy",
-        "pageSize": 3,
-        "apiKey": NEWS_API_KEY,
-    }
-    try:
-        resp = requests.get(_NEWS_ENDPOINT, params=params, timeout=5)
-        resp.raise_for_status()
-        articles = resp.json().get("articles", [])[:3]
-        headlines = [art.get("title") for art in articles if art.get("title")]
-        if len(headlines) < 3:
-            raise ValueError("Not enough headlines returned")
-        return headlines
-    except Exception:  # noqa: BLE001
-        return _get_time_based_demo_news()
 
-
-def _get_time_based_demo_news() -> List[str]:
+def _get_time_based_demo_news() -> List[dict]:
     """Generate time-based demo news that changes every 5 minutes."""
     # Use current time rounded to 5-minute intervals as seed
     now = datetime.now(timezone.utc)
     time_slot = (now.hour * 60 + (now.minute // 5) * 5)  # 5-minute intervals
     
-    # Predefined news sets that rotate
+    # Predefined news sets that rotate - now with structured data
     news_sets = [
         [
-            "Bitcoin shows resilience after Fed comments",
-            "Analyst predicts BTC surge amid institutional inflows", 
-            "Market uncertainty as BTC faces regulatory pressure",
+            {
+                'title': "Bitcoin shows resilience after Fed comments",
+                'content': "Bitcoin's price remained stable following the Federal Reserve's latest policy announcement, demonstrating the cryptocurrency's growing maturity and institutional acceptance in traditional financial markets.",
+                'url': "https://example-news.com/bitcoin-fed-resilience"
+            },
+            {
+                'title': "Analyst predicts BTC surge amid institutional inflows",
+                'content': "Leading cryptocurrency analyst forecasts a significant price increase for Bitcoin as institutional investors continue to allocate funds to digital assets, citing improved regulatory clarity.",
+                'url': "https://example-news.com/btc-institutional-surge"
+            },
+            {
+                'title': "Market uncertainty as BTC faces regulatory pressure",
+                'content': "Bitcoin markets show signs of volatility as regulatory authorities worldwide continue to develop frameworks for cryptocurrency oversight, creating uncertainty among traders.",
+                'url': "https://example-news.com/btc-regulatory-pressure"
+            }
         ],
         [
-            "Bitcoin price remains flat in low-volume session",
-            "Investors eye ETF approval timeline",
-            "Regulatory headwinds could impact crypto adoption",
+            {
+                'title': "Bitcoin price remains flat in low-volume session",
+                'content': "Trading volumes hit multi-week lows as Bitcoin consolidated around key support levels, with market participants awaiting clearer directional signals.",
+                'url': "https://example-news.com/btc-low-volume-flat"
+            },
+            {
+                'title': "Investors eye ETF approval timeline",
+                'content': "Market attention focuses on pending Bitcoin ETF applications as regulatory decisions could significantly impact institutional adoption and price discovery.",
+                'url': "https://example-news.com/btc-etf-timeline"
+            },
+            {
+                'title': "Regulatory headwinds could impact crypto adoption",
+                'content': "Industry experts warn that increasing regulatory scrutiny may slow mainstream cryptocurrency adoption, though clearer rules could ultimately benefit the sector.",
+                'url': "https://example-news.com/crypto-regulatory-headwinds"
+            }
         ],
         [
-            "Major institutional investor adds Bitcoin to portfolio",
-            "Technical analysis suggests BTC breakout imminent",
-            "Mining difficulty adjustment impacts market sentiment",
-        ],
-        [
-            "Central bank digital currencies spark Bitcoin debate",
-            "Whale movements detected on blockchain analytics",
-            "Options expiry creates volatility in BTC markets",
-        ],
-        [
-            "Lightning Network adoption reaches new milestone",
-            "Energy concerns resurface in crypto discussions",
-            "Bitcoin correlation with traditional markets weakens",
-        ],
-        [
-            "DeFi protocols integrate Bitcoin through wrapped tokens",
-            "Geopolitical tensions drive safe haven demand for BTC",
-            "Bitcoin futures open interest hits record levels",
+            {
+                'title': "Major institutional investor adds Bitcoin to portfolio",
+                'content': "A Fortune 500 company announced the addition of Bitcoin to its treasury reserves, signaling growing corporate acceptance of cryptocurrency as a store of value.",
+                'url': "https://example-news.com/institutional-btc-portfolio"
+            },
+            {
+                'title': "Technical analysis suggests BTC breakout imminent",
+                'content': "Chart patterns indicate Bitcoin may be approaching a significant price movement, with key resistance levels being tested amid increasing trading activity.",
+                'url': "https://example-news.com/btc-technical-breakout"
+            },
+            {
+                'title': "Mining difficulty adjustment impacts market sentiment",
+                'content': "Bitcoin's latest mining difficulty adjustment reflects network health and could influence market sentiment as mining economics continue to evolve.",
+                'url': "https://example-news.com/btc-mining-difficulty"
+            }
         ]
     ]
     
+    # Add more news sets to reach 6 total (keeping it shorter for demo)
     # Select news set based on time slot
     set_index = (time_slot // 5) % len(news_sets)  # Rotate every 5 minutes
     return news_sets[set_index]
 
 
 # ---------------------------------------------------------------------------
-# LLM-based sentiment analysis
+# LLM-based market impact analysis
 # ---------------------------------------------------------------------------
 
-def _analyze_sentiment_with_llm(headlines: List[str]) -> List[dict]:
-    """Use LLM with structured output to analyze sentiment of Bitcoin headlines."""
+def _analyze_market_impact_with_llm(news_items: List[dict]) -> dict:
+    """Use LLM to analyze how news impacts market outcome probability."""
+    
+    if not news_items:
+        return {
+            "direction": "NEUTRAL",
+            "impact": "LOW", 
+            "confidence": 0.0,
+            "reasoning": "No news items to analyze",
+            "news_urls": []
+        }
+    
+    # Get market context
+    context = _get_market_context()
+    market_title = context['title']
+    market_description = context['description']
+    
+    # Build news text for analysis
+    news_text = ""
+    news_urls = []
+    for i, item in enumerate(news_items):
+        title = item.get('title', '')
+        content = item.get('content', '')
+        url = item.get('url', '')
+        news_urls.append(url)
+        news_text += f"{i+1}. Title: {title}\n   Content: {content}\n   Source: {url}\n\n"
+    
+    prompt = f"""You are a prediction market analyst. Analyze how the following news impacts the likelihood of this market outcome.
+
+MARKET CONTEXT:
+Title: {market_title}
+Description: {market_description}
+
+NEWS TO ANALYZE:
+{news_text}
+
+TASK: Determine how this news affects the probability of the market resolving to "YES".
+
+OPTIONS:
+- INCREASES_YES: News makes the outcome MORE likely
+- INCREASES_NO: News makes the outcome LESS likely  
+- NEUTRAL: News is irrelevant, spam, or has no clear impact on the market outcome
+
+Consider:
+- Is this news directly related to the market outcome?
+- Does it provide new information that affects probability?
+- How significant is this impact? (LOW/MEDIUM/HIGH)
+- How confident are you in this assessment? (0.0 to 1.0)
+- Provide 1-2 sentence reasoning
+
+Focus on:
+- Direct causal relationships to the market outcome
+- New information vs already known facts
+- Market timing and relevance
+- Magnitude of potential impact
+
+If news is unrelated, spam, or provides no meaningful signal, choose NEUTRAL with LOW impact.
+"""
+
+    try:
+        llm = ChatOpenAI(
+            model_name=os.getenv("POLY_AGENT_MODEL", "gpt-4o-mini"),
+            temperature=0.1
+        )
+        
+        # Use structured output with Pydantic model
+        structured_llm = llm.with_structured_output(MarketImpactAnalysis)
+        response = structured_llm.invoke(prompt)
+        
+        # Add news URLs to response
+        return {
+            "direction": response.direction,
+            "impact": response.impact,
+            "confidence": response.confidence,
+            "reasoning": response.reasoning,
+            "news_urls": news_urls
+        }
+                
+    except Exception as e:
+        print(f"LLM market impact analysis failed: {e}")
+        # Fallback to neutral analysis
+        return {
+            "direction": "NEUTRAL",
+            "impact": "LOW", 
+            "confidence": 0.0,
+            "reasoning": "Analysis unavailable - LLM error occurred",
+            "news_urls": news_urls
+        }
+
+
+# ---------------------------------------------------------------------------
+# LLM-based sentiment analysis (deprecated)
+# ---------------------------------------------------------------------------
+
+def _analyze_sentiment_with_llm(news_items: List[dict]) -> List[dict]:
+    """Use LLM with structured output to analyze sentiment of news items."""
     
     market_id = POLYMARKET_MARKET_ID
-    headlines_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(headlines)])
+    news_text = ""
+    for i, item in enumerate(news_items):
+        title = item.get('title', '')
+        content = item.get('content', '')
+        url = item.get('url', '')
+        news_text += f"{i+1}. Title: {title}\n   Content: {content}\n   Source: {url}\n\n"
     
-    prompt = f"""You are a financial sentiment analyst specialized in Bitcoin markets.
+    prompt = f"""You are a financial sentiment analyst specialized in prediction markets.
 
-Analyze the following Bitcoin headlines for the market: {market_id}
+Analyze the following news items for the market: {market_id}
 
-Headlines:
-{headlines_text}
+News Items:
+{news_text}
 
-For each headline, provide:
-1. A sentiment score from -1.0 (very negative for BTC price) to +1.0 (very positive for BTC price)
+For each news item, provide:
+1. A sentiment score from -1.0 (very negative for market outcome) to +1.0 (very positive for market outcome)
 2. Brief reasoning (max 30 words)
 
 Consider:
 - Market impact potential (institutional vs retail focus)
-- Regulatory implications
+- Regulatory implications  
 - Technical vs fundamental news
 - Short-term vs long-term price effects
+- Content depth and source reliability
+
+Analyze both the title and content for comprehensive sentiment assessment.
 
 Also provide an overall market sentiment and your confidence in the analysis.
 """
@@ -249,26 +530,32 @@ Also provide an overall market sentiment and your confidence in the analysis.
         structured_llm = llm.with_structured_output(SentimentAnalysisResponse)
         response = structured_llm.invoke(prompt)
         
-        # Convert to the expected format for backward compatibility
-        return [
-            {
+        # Convert to the expected format with URLs
+        results = []
+        for i, analysis in enumerate(response.analyses):
+            result = {
                 "headline": analysis.headline,
                 "sentiment_score": analysis.sentiment_score,
                 "reasoning": analysis.reasoning
             }
-            for analysis in response.analyses
-        ]
+            # Add URL if available from original news items
+            if i < len(news_items):
+                result["url"] = news_items[i].get("url", "")
+            results.append(result)
+        
+        return results
                 
     except Exception as e:
         print(f"LLM sentiment analysis failed: {e}")
         # Fallback to simple keyword analysis
         return [
             {
-                "headline": h, 
-                "sentiment_score": _fallback_sentiment(h), 
-                "reasoning": "LLM unavailable - keyword fallback"
+                "headline": item.get('title', ''), 
+                "sentiment_score": _fallback_sentiment(item.get('title', '')), 
+                "reasoning": "LLM unavailable - keyword fallback",
+                "url": item.get('url', '')
             } 
-            for h in headlines
+            for item in news_items
         ]
 
 
@@ -308,27 +595,71 @@ def get_market_data() -> dict:
     }
 
 
-@tool
-def get_news() -> List[str]:
-    """Return a list of raw Bitcoin news headlines."""
-    return _fetch_news()
+@tool  
+def get_news(search_query: str) -> List[dict]:
+    """Search for news articles relevant to trading decisions.
+    
+    Returns exactly one news item (in a list) to avoid duplicate analysis across runs.
+    Uses caching to ensure fresh content each time.
+    
+    Parameters:
+    - search_query: Specific search query or question to execute with Tavily.
+      Examples: "What is causing USDT to depeg?", "Why is Tether losing its peg?", 
+                "Latest news on stablecoin depegging events", "USDT regulatory concerns 2025"
+    
+    Returns:
+    - List containing one news item with 'title', 'content', and 'url' fields
+    """
+    print(f"DEBUG: Agent requested news search: '{search_query}'")
+    
+    # Get usage cache from global state (will be set by the agent)
+    usage_cache = getattr(get_news, '_usage_cache', {})
+    print(f"DEBUG: Using news cache with {len(usage_cache)} cached URLs")
+    
+    return _fetch_news(search_query, usage_cache)
 
 
 @tool
-def analyze_sentiment(headlines: List[str]) -> List[dict]:
-    """Analyze sentiment of headlines using LLM for sophisticated market analysis.
+def analyze_market_impact(news_items: List[dict]) -> dict:
+    """Analyze how news impacts the likelihood of the market outcome.
+
+    IMPORTANT: This tool requires news items as input. Use the results from get_news() calls.
+    
+    CORRECT USAGE PATTERN:
+    1. First call: get_news("your search query") 
+    2. Then call: analyze_market_impact(news_items_from_step_1)
+    
+    Example workflow:
+    - news_result = get_news("USDT stability concerns 2025")
+    - impact_result = analyze_market_impact(news_result)
 
     Parameters
     ----------
-    headlines : List[str]
-        Raw news headlines to analyse.
+    news_items : List[dict], REQUIRED
+        Structured news items with 'title', 'content', and 'url' fields.
+        Must provide the exact news items you want to analyze.
+        Do NOT call this tool with empty arguments {}
 
     Returns
     -------
-    List[dict]
-        Each dict contains ``headline``, ``sentiment_score`` (-1 .. 1), and ``reasoning``.
+    dict
+        Contains:
+        - direction: "INCREASES_YES" | "INCREASES_NO" | "NEUTRAL"
+        - impact: "LOW" | "MEDIUM" | "HIGH" 
+        - confidence: 0.0-1.0
+        - reasoning: Brief explanation (1-2 sentences)
+        - news_urls: List of source URLs
     """
-    return _analyze_sentiment_with_llm(headlines)
+    if not news_items or len(news_items) == 0:
+        return {
+            "direction": "NEUTRAL",
+            "impact": "LOW",
+            "confidence": 0.0,
+            "reasoning": "No news items provided for analysis",
+            "news_urls": []
+        }
+    
+    return _analyze_market_impact_with_llm(news_items)
 
 
 @tool  
@@ -342,6 +673,11 @@ def trade(action: Literal["BUY", "SELL"], position: Literal["YES", "NO"], usd: f
     - action: BUY or SELL
     - position: YES or NO (which side to trade)
     - usd: Trade amount in USD
+    
+    Examples:
+    - trade("BUY", "YES", 100.0) → Buy $100 of YES contracts
+    - trade("BUY", "NO", 200.0) → Buy $200 of NO contracts  
+    - trade("SELL", "YES", 50.0) → Sell $50 worth of YES holdings
     """
     # Basic validation: minimum and maximum trade amounts
     MIN_TRADE_USD = 1.0
@@ -403,4 +739,4 @@ def trade(action: Literal["BUY", "SELL"], position: Literal["YES", "NO"], usd: f
     }
 
 
-TOOLS = [get_market_data, get_news, analyze_sentiment, trade]
+TOOLS = [get_market_data, get_news, analyze_market_impact, trade]
