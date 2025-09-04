@@ -549,4 +549,6 @@ agent_graph = builder.compile(name="PolymarketTraderAgent")
 
 __all__ = [
     "agent_graph",
+    "builder",
+    "AgentState",
 ]
