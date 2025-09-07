@@ -29,6 +29,7 @@ except ImportError:
     from langchain.chat_models import ChatOpenAI
 
 from langchain_core.tools import tool
+from langgraph.types import interrupt
 
 from .models import OrderModel, SentimentAnalysisResponse, MarketImpactAnalysis
 
@@ -453,8 +454,8 @@ If news is unrelated, spam, or provides no meaningful signal, choose NEUTRAL wit
 
     try:
         llm = ChatOpenAI(
-            model_name=os.getenv("POLY_AGENT_MODEL", "gpt-4o-mini"),
-            temperature=0.1
+            model_name=os.getenv("POLY_AGENT_MODEL", "gpt-5-mini"),
+            temperature=1
         )
         
         # Use structured output with Pydantic model
@@ -522,8 +523,8 @@ Also provide an overall market sentiment and your confidence in the analysis.
 
     try:
         llm = ChatOpenAI(
-            model_name=os.getenv("POLY_AGENT_MODEL", "gpt-4o-mini"),
-            temperature=0.1
+            model_name=os.getenv("POLY_AGENT_MODEL", "gpt-5-mini"),
+            temperature=1
         )
         
         # Use structured output with Pydantic model
@@ -573,6 +574,53 @@ def _fallback_sentiment(headline: str) -> float:
         if kw in lower:
             s -= 0.15
     return max(-1.0, min(1.0, s))
+
+
+def _extract_market_analysis(messages: List) -> dict:
+    """Extract market analysis from recent analyze_market_impact tool results.
+    
+    Args:
+        messages: List of conversation messages
+        
+    Returns:
+        Dict with market analysis or fallback dict
+    """
+    if not messages:
+        return {
+            "direction": "UNKNOWN",
+            "impact": "UNKNOWN",
+            "confidence": 0.0,
+            "analysis": "No market analysis available - no messages found"
+        }
+    
+    for msg in reversed(messages):
+        if hasattr(msg, 'type') and msg.type == 'tool' and hasattr(msg, 'name') and msg.name == 'analyze_market_impact':
+            try:
+                import json
+                if isinstance(msg.content, str):
+                    result = json.loads(msg.content)
+                elif isinstance(msg.content, dict):
+                    result = msg.content
+                else:
+                    continue
+                
+                if isinstance(result, dict):
+                    return {
+                        "direction": result.get('direction', 'UNKNOWN'),
+                        "impact": result.get('impact', 'UNKNOWN'),
+                        "confidence": result.get('confidence', 0.0),
+                        "analysis": result.get('reasoning', 'No reasoning provided')
+                    }
+                    
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+    
+    return {
+        "direction": "UNKNOWN",
+        "impact": "UNKNOWN",
+        "confidence": 0.0,
+        "analysis": "No market impact analysis found - trading based on market data only"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +745,52 @@ def trade(action: Literal["BUY", "SELL"], position: Literal["YES", "NO"], usd: f
             "success": False
         }
     
+    current_messages = getattr(trade, '_current_messages', [])
+    analysis_dict = _extract_market_analysis(current_messages)
+    
+    market_context = _get_market_context()
+    market_title = market_context.get('title', 'Unknown Market')
+    
     market_data = _fetch_polymarket_data()
+    price = market_data[f"{position.lower()}_price"]
+    contracts = usd / price
+    
+    interrupt_data = {
+        "type": "trade_approval_request",
+        "trade": {
+            "action": action,
+            "position": position,
+            "usd_amount": usd,
+            "price": price,
+            "contracts": round(contracts, 2)
+        },
+        "market": {
+            "title": market_title
+        },
+        "market_analysis": analysis_dict,
+        "message": "Do you approve this trade?",
+        "options": ["yes", "no"]
+    }
+    
+    response = interrupt(interrupt_data)
+    
+    # Handle user response
+    if isinstance(response, str):
+        approval = response.lower().strip()
+    else:
+        approval = str(response).lower().strip()
+    
+    if approval not in ["yes", "y", "approve", "ok"]:
+        # Trade rejected by user
+        return {
+            "tool_name": "trade",
+            "error": f"Trade cancelled by user: {approval}",
+            "success": False,
+            "user_cancelled": True,
+            "action_summary": f"CANCELLED: {action} {position} ${usd:.2f} (User rejected)"
+        }
+    
+    # market_data = _fetch_polymarket_data()
     yes_price = market_data["yes_price"] 
     no_price = market_data["no_price"]
     timestamp = datetime.now(timezone.utc)

@@ -30,7 +30,7 @@ from .tools import TOOLS, get_market_data, get_news, _fetch_real_market_data, _i
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = os.getenv("POLY_AGENT_MODEL", "gpt-4o-mini")  # configurable
+MODEL_NAME = os.getenv("POLY_AGENT_MODEL", "gpt-5-mini")
 MAX_TOOL_STEPS = int(os.getenv("POLY_AGENT_MAX_STEPS", "6"))
 
 # Entry guard configuration
@@ -62,6 +62,7 @@ class AgentState(TypedDict, total=False):
     - ``_skip_run``: Internal flag to skip run (set by entry_guard)
     - ``skip_reason``: Reason why run was skipped (if applicable)
     - ``news_usage_cache``: Cache of news URLs with usage counts
+    - ``_user_cancelled_trade``: Internal flag when user cancels a trade (ends run)
     """
 
     messages: Annotated[List[BaseMessage], add_messages]
@@ -76,6 +77,7 @@ class AgentState(TypedDict, total=False):
     _skip_run: Optional[bool]
     skip_reason: Optional[str]
     news_usage_cache: Optional[Dict[str, int]]
+    _user_cancelled_trade: Optional[bool]
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +240,13 @@ def call_model(state: AgentState) -> Dict[str, List[AIMessage] | int]:
     current_cache = state.get('news_usage_cache', {})
     get_news._usage_cache = current_cache
     print(f"DEBUG: Set news cache with {len(current_cache)} URLs")
+    
+    # Set up current messages for trade tool rationale extraction
+    from .tools import trade
+    trade._current_messages = state.get("messages", [])
+    print(f"DEBUG: Set current messages for trade tool ({len(state.get('messages', []))} messages)")
 
-    llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0).bind_tools(TOOLS)
+    llm = ChatOpenAI(model_name=MODEL_NAME, temperature=1).bind_tools(TOOLS)
     
     # Debug: Check what tools are available
     print(f"DEBUG: Available tools: {[tool.name for tool in TOOLS]}")
@@ -379,10 +386,20 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, 
                         updates['last_5_actions'] = new_actions
                 else:
                     # Trade failed at tool level - add error to action history
-                    error_msg = result.get('error', 'Trade failed')
+                    # Check if we have a custom action_summary (e.g., for user cancellations)
+                    if 'action_summary' in result:
+                        action_msg = result['action_summary']
+                    else:
+                        error_msg = result.get('error', 'Trade failed')
+                        action_msg = f"FAILED: {error_msg}"
+                    
                     current_actions = state.get('last_5_actions', [])
-                    new_actions = (current_actions + [f"FAILED: {error_msg}"])[-5:]
+                    new_actions = (current_actions + [action_msg])[-5:]
                     updates['last_5_actions'] = new_actions
+                    
+                    # If user cancelled the trade, set flag to end the run
+                    if result.get('user_cancelled'):
+                        updates['_user_cancelled_trade'] = True
         
         elif tool_name == 'get_news':
             # Process news tool result and update usage cache
@@ -518,6 +535,16 @@ def route_after_llm(state: AgentState) -> Literal["tools", "__end__"]:
     return "__end__"
 
 
+def route_after_apply_updates(state: AgentState) -> Literal["llm", "__end__"]:
+    """Routes after apply_updates - check for user cancellation."""
+    
+    if state.get("_user_cancelled_trade"):
+        print("ROUTING: User cancelled trade - ending run")
+        return "__end__"
+    
+    return "llm"
+
+
 # ---------------------------------------------------------------------------
 # Assemble graph
 # ---------------------------------------------------------------------------
@@ -536,9 +563,9 @@ builder.add_edge("context", "llm")
 
 # After LLM, decide whether __end__ or tools
 builder.add_conditional_edges("llm", route_after_llm)
-# After tools, apply updates then go back to LLM
+# After tools, apply updates then check for cancellation
 builder.add_edge("tools", "apply_updates")
-builder.add_edge("apply_updates", "llm")
+builder.add_conditional_edges("apply_updates", route_after_apply_updates)
 
 
 # from langgraph.checkpoint.memory import InMemorySaver
