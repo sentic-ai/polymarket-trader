@@ -40,6 +40,10 @@ interface RunData {
 }
 
 export default function Home() {
+  // Get agent configuration from environment variables
+  const AGENT_ID = process.env.NEXT_PUBLIC_AGENT_ID || "polymarket-trader";
+  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  
   const MARKET_DATA_API_URL = "/api/polymarket/market";
   const INITIAL_AMOUNT = 10000;
   const [isAgentRunning, setIsAgentRunning] = useState(false);
@@ -268,7 +272,7 @@ export default function Home() {
   const fetchAgentStats = async () => {
     try {
       const response = await fetch(
-        "http://localhost:8000/agents/polymarket-trader/status"
+        `${BACKEND_URL}/agents/${AGENT_ID}/status`
       );
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
@@ -381,7 +385,7 @@ export default function Home() {
 
   const fetchRuns = async () => {
     try {
-      const response = await fetch("http://localhost:8000/runs");
+      const response = await fetch(`${BACKEND_URL}/runs`);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -848,7 +852,7 @@ export default function Home() {
           wsRetryCountRef.current + 1
         }/${MAX_RETRIES})`
       );
-      const ws = new WebSocket("ws://localhost:8000/ws/general");
+      const ws = new WebSocket(`${BACKEND_URL.replace('http', 'ws')}/ws/general`);
       generalWsRef.current = ws;
 
       ws.onopen = () => {
@@ -990,7 +994,7 @@ export default function Home() {
     
     if (currentRunId) {
       try {
-        const response = await fetch(`http://localhost:8000/runs/${currentRunId}/approve`, {
+        const response = await fetch(`${BACKEND_URL}/runs/${currentRunId}/approve`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1061,7 +1065,7 @@ export default function Home() {
 
     try {
       // Make POST request to start the agent
-      const response = await fetch("http://localhost:8000/runs", {
+      const response = await fetch(`${BACKEND_URL}/runs`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
