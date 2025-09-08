@@ -39,11 +39,53 @@ interface RunData {
   }>;
 }
 
+// WebSocket message types
+interface WebSocketMessage {
+  type: string;
+  data?: {
+    runs?: Array<{ agent_id: string; [key: string]: unknown }>;
+    agent_id?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+// Helper function to check if a WebSocket message is relevant to this agent
+function isMessageForThisAgent(
+  message: WebSocketMessage,
+  currentAgentId: string
+): boolean {
+  // Always show system-wide messages (like execution_state updates)
+  if (message.type === "execution_state") {
+    return true; // System messages relevant to all
+  }
+
+  // For run-related messages, check if any runs belong to this agent
+  if (message.data?.runs) {
+    // Message contains runs array - check if any runs belong to this agent
+    const relevantRuns = message.data.runs.filter(
+      (run) => run.agent_id === currentAgentId
+    );
+    return relevantRuns.length > 0;
+  }
+
+  // For single run messages, check the run's agent_id
+  if (message.data?.agent_id) {
+    return message.data.agent_id === currentAgentId;
+  }
+
+  // For node updates or other run-specific messages, check if they have run context
+  // We might need to cross-reference with current runs to determine agent ownership
+  // For now, show messages that don't have clear agent association (conservative approach)
+  return true;
+}
+
 export default function Home() {
   // Get agent configuration from environment variables
   const AGENT_ID = process.env.NEXT_PUBLIC_AGENT_ID || "polymarket-trader";
-  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
-  
+  const BACKEND_URL =
+    process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
   const MARKET_DATA_API_URL = "/api/polymarket/market";
   const INITIAL_AMOUNT = 10000;
   const [isAgentRunning, setIsAgentRunning] = useState(false);
@@ -271,9 +313,7 @@ export default function Home() {
   // Fetch agent stats from API
   const fetchAgentStats = async () => {
     try {
-      const response = await fetch(
-        `${BACKEND_URL}/agents/${AGENT_ID}/status`
-      );
+      const response = await fetch(`${BACKEND_URL}/agents/${AGENT_ID}/status`);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -410,7 +450,7 @@ export default function Home() {
             tradePrice: tradeAction.price,
             tradeAmount: tradeAction.amount,
             timestamp: run.completed_at
-              ? new Date(run.completed_at).toLocaleTimeString()
+              ? new Date(run.completed_at).toLocaleTimeString("en-US")
               : "Unknown",
             cost: "Free Run",
             rationale: rationale,
@@ -482,25 +522,27 @@ export default function Home() {
             run_id?: string;
           };
         };
-        
+
         const tradeData = msgWithRunId.data?.trade_details?.trade;
         const runId = msgWithRunId.run_id || msgWithRunId.data?.run_id;
-        
+
         if (tradeData && runId) {
           // Show approval request with trade details
           const tradeDetails = {
             action: tradeData.action || "UNKNOWN",
-            amount: `${Math.round(tradeData.contracts || 0)} ${tradeData.position || ""}`,
+            amount: `${Math.round(tradeData.contracts || 0)} ${
+              tradeData.position || ""
+            }`,
             price: `$${tradeData.price || "0.00"}`,
           };
-          
+
           // Trigger approval request UI
           setTimeout(() => {
             setCurrentRunId(runId);
             setShowAgentRequest(true);
             setPendingTradeDetails(tradeDetails);
             setIsWaitingForApproval(true);
-            
+
             // Scroll to approval box
             if (agentRequestRef.current) {
               agentRequestRef.current.scrollIntoView({
@@ -510,11 +552,11 @@ export default function Home() {
             }
           }, 100);
         }
-        
-        return { 
-          entity: "SYSTEM", 
+
+        return {
+          entity: "SYSTEM",
           message: "Trade approval required - waiting for user decision",
-          showApprovalRequest: true 
+          showApprovalRequest: true,
         };
       }
 
@@ -852,7 +894,9 @@ export default function Home() {
           wsRetryCountRef.current + 1
         }/${MAX_RETRIES})`
       );
-      const ws = new WebSocket(`${BACKEND_URL.replace('http', 'ws')}/ws/general`);
+      const ws = new WebSocket(
+        `${BACKEND_URL.replace("http", "ws")}/ws/general`
+      );
       generalWsRef.current = ws;
 
       ws.onopen = () => {
@@ -894,6 +938,18 @@ export default function Home() {
         try {
           const message = JSON.parse(event.data);
           console.log("🟢 General parsed JSON message:", message);
+
+          // Filter messages by agent ID - only process messages related to this agent
+          const isRelevantMessage = isMessageForThisAgent(message, AGENT_ID);
+          if (!isRelevantMessage) {
+            console.log(
+              `🔇 Filtered out message - not for agent ${AGENT_ID}:`,
+              message
+            );
+            return; // Skip processing this message
+          }
+
+          console.log(`✅ Processing message for agent ${AGENT_ID}:`, message);
 
           const translation = translateWebSocketMessage(message);
           const timestamp = new Date().toLocaleTimeString("en-US", {
@@ -991,18 +1047,21 @@ export default function Home() {
 
   const handleApproval = async (approved: boolean) => {
     console.log(`🔔 User approval decision: ${approved ? "YES" : "NO"}`);
-    
+
     if (currentRunId) {
       try {
-        const response = await fetch(`${BACKEND_URL}/runs/${currentRunId}/approve`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            decision: approved ? "yes" : "no"
-          }),
-        });
+        const response = await fetch(
+          `${BACKEND_URL}/runs/${currentRunId}/approve`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              decision: approved ? "yes" : "no",
+            }),
+          }
+        );
 
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
@@ -1016,7 +1075,7 @@ export default function Home() {
     } else {
       console.error("❌ No run ID available for approval");
     }
-    
+
     if (approvalResolveRef.current) {
       approvalResolveRef.current(approved);
       approvalResolveRef.current = null;
@@ -1071,6 +1130,7 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
+          agent_id: AGENT_ID,
           agent_type: "polymarket-trader",
           parameters: {
             debug_mode: true,
@@ -1133,7 +1193,7 @@ export default function Home() {
       // Optionally show error to user
       setTerminalContent([
         {
-          time: `[${new Date().toLocaleTimeString()}]`,
+          time: `[${new Date().toLocaleTimeString("en-US")}]`,
           type: "ERROR",
           message: "Failed to start agent. Check connection to backend.",
           color: "text-red-400",
@@ -1544,7 +1604,7 @@ export default function Home() {
                                   </span>
                                   <span className="font-semibold text-white">
                                     $
-                                    {calculateProfit().totalBalance.toLocaleString()}{" "}
+                                    {calculateProfit().totalBalance.toLocaleString('en-US')}{" "}
                                     <span
                                       className={`text-xs font-normal ${
                                         calculateProfit().percentage >= 0
@@ -1567,7 +1627,7 @@ export default function Home() {
                                   </span>
                                   <span className="font-semibold text-white">
                                     $
-                                    {agentStats?.balance?.toLocaleString() ||
+                                    {agentStats?.balance?.toLocaleString('en-US') ||
                                       "9,959"}
                                   </span>
                                 </div>
