@@ -74,33 +74,33 @@ function isMessageForThisAgent(
     return message.data.agent_id === currentAgentId;
   }
 
-  // For node updates or other run-specific messages, check if they have run context
-  // We might need to cross-reference with current runs to determine agent ownership
-  // For now, show messages that don't have clear agent association (conservative approach)
-  return true;
+  return false;
 }
 
 export default function Home() {
   // Get agent configuration dynamically from URL or environment variables
   const [AGENT_ID, setAgentId] = useState<string>("");
   const [BACKEND_URL, setBackendUrl] = useState<string>("");
-  
+
   useEffect(() => {
     // Extract agent ID from subdomain (e.g., polymarket-trader-u7i1502d.sentic.ai)
-    const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+    const hostname =
+      typeof window !== "undefined" ? window.location.hostname : "";
     let agentId = "";
     let backendUrl = "";
-    
-    if (hostname.includes('.sentic.ai')) {
+
+    if (hostname.includes(".sentic.ai")) {
       // Extract agent ID from subdomain
-      agentId = hostname.split('.')[0];
-      backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "https://api.sentic.ai";
+      agentId = hostname.split(".")[0];
+      backendUrl =
+        process.env.NEXT_PUBLIC_BACKEND_URL || "https://api.sentic.ai";
     } else {
       // Fallback to environment variables for localhost
       agentId = process.env.NEXT_PUBLIC_AGENT_ID || "polymarket-trader";
-      backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      backendUrl =
+        process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
     }
-    
+
     console.log(`🎯 Dynamic Agent ID: ${agentId}, Backend: ${backendUrl}`);
     console.log(`🌐 Current hostname: ${hostname}`);
     setAgentId(agentId);
@@ -446,7 +446,7 @@ export default function Home() {
 
   const fetchRuns = async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/runs`);
+      const response = await fetch(`${BACKEND_URL}/agents/${AGENT_ID}/runs`);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -868,7 +868,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!AGENT_ID || !BACKEND_URL) return; // Don't fetch until agent ID is loaded
-    
+
     fetchAgentStats();
 
     statsIntervalRef.current = setInterval(fetchAgentStats, 5000);
@@ -894,7 +894,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!AGENT_ID || !BACKEND_URL) return; // Don't fetch until agent ID is loaded
-    
+
     fetchRuns();
 
     const runsIntervalRef = setInterval(fetchRuns, 5000);
@@ -907,7 +907,7 @@ export default function Home() {
   // Connect to general WebSocket on component mount
   useEffect(() => {
     if (!AGENT_ID || !BACKEND_URL) return; // Don't connect until agent ID is loaded
-    
+
     const connectGeneralWebSocket = () => {
       if (wsRetryCountRef.current >= MAX_RETRIES) {
         console.log(
@@ -1481,7 +1481,9 @@ export default function Home() {
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center">
           <div className="animate-spin w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full mx-auto mb-4"></div>
-          <p className="text-zinc-600 dark:text-zinc-400">Loading agent configuration...</p>
+          <p className="text-zinc-600 dark:text-zinc-400">
+            Loading agent configuration...
+          </p>
         </div>
       </div>
     );
@@ -1644,7 +1646,9 @@ export default function Home() {
                                   </span>
                                   <span className="font-semibold text-white">
                                     $
-                                    {calculateProfit().totalBalance.toLocaleString('en-US')}{" "}
+                                    {calculateProfit().totalBalance.toLocaleString(
+                                      "en-US"
+                                    )}{" "}
                                     <span
                                       className={`text-xs font-normal ${
                                         calculateProfit().percentage >= 0
@@ -1667,8 +1671,9 @@ export default function Home() {
                                   </span>
                                   <span className="font-semibold text-white">
                                     $
-                                    {agentStats?.balance?.toLocaleString('en-US') ||
-                                      "9,959"}
+                                    {agentStats?.balance?.toLocaleString(
+                                      "en-US"
+                                    ) || "9,959"}
                                   </span>
                                 </div>
                               </div>
