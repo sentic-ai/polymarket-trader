@@ -158,6 +158,7 @@ export default function Home() {
   const [runCounter, setRunCounter] = useState(235);
   const [marketData, setMarketData] = useState<MarketData | null>(null);
   const [agentStats, setAgentStats] = useState<AgentStats | null>(null);
+  const [totalAgents, setTotalAgents] = useState<number>(0);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const isAutoScrolling = useRef(false);
   const [showAgentRequest, setShowAgentRequest] = useState(false);
@@ -278,7 +279,7 @@ export default function Home() {
   };
 
   const calculateTotalBalance = (): number => {
-    if (!agentStats || !marketData) return 10234;
+    if (!agentStats || !marketData) return INITIAL_AMOUNT;
     const cash = agentStats.balance || 0;
     const yesValue =
       (agentStats.yes_holdings || 0) *
@@ -391,6 +392,21 @@ export default function Home() {
     }
   };
 
+  // Fetch total agents count from API
+  const fetchTotalAgents = async () => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/agents`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = (await response.json()) as { total_agents: number };
+      console.log("📊 Total agents:", data.total_agents);
+      setTotalAgents(data.total_agents);
+    } catch (error) {
+      console.error("❌ Error fetching total agents:", error);
+    }
+  };
+
   const fetchMarketData = async () => {
     try {
       const response = await fetch(MARKET_DATA_API_URL);
@@ -445,7 +461,7 @@ export default function Home() {
       } catch {}
     }
 
-    console.error("❌ CONVICTION not found in logs for run");
+    console.warn("❌ CONVICTION not found in logs for run");
     return 0;
   };
 
@@ -612,21 +628,25 @@ export default function Home() {
             price: `$${tradeData.price || "0.00"}`,
           };
 
-          // Trigger approval request UI
+          // Trigger approval request UI with smooth transition
           setTimeout(() => {
             setCurrentRunId(runId);
-            setShowAgentRequest(true);
             setPendingTradeDetails(tradeDetails);
             setIsWaitingForApproval(true);
-
-            // Scroll to approval box
-            if (agentRequestRef.current) {
-              agentRequestRef.current.scrollIntoView({
-                behavior: "smooth",
-                block: "center",
-              });
-            }
-          }, 100);
+            
+            // Show the approval UI first
+            setShowAgentRequest(true);
+            
+            // Wait a moment for the UI to render, then scroll smoothly
+            setTimeout(() => {
+              if (agentRequestRef.current) {
+                agentRequestRef.current.scrollIntoView({
+                  behavior: "smooth",
+                  block: "center",
+                });
+              }
+            }, 300); // Give time for the popup to appear
+          }, 800); // Longer delay before showing popup
         }
 
         return {
@@ -963,13 +983,16 @@ export default function Home() {
     if (!AGENT_ID || !BACKEND_URL) return; // Don't fetch until agent ID is loaded
 
     fetchAgentStats();
+    fetchTotalAgents();
 
     statsIntervalRef.current = setInterval(fetchAgentStats, 5000);
+    const totalAgentsIntervalRef = setInterval(fetchTotalAgents, 30000); // Update every 30 seconds
 
     return () => {
       if (statsIntervalRef.current) {
         clearInterval(statsIntervalRef.current);
       }
+      clearInterval(totalAgentsIntervalRef);
     };
   }, [AGENT_ID, BACKEND_URL]);
 
@@ -1727,7 +1750,7 @@ export default function Home() {
                         <div className="flex items-center justify-center gap-6 text-zinc-400 dark:text-zinc-500">
                           <span className="text-lg">
                             <span className="font-semibold text-white">
-                              {agentStats?.runs_last_24h || 5}
+                              {agentStats?.runs_last_24h || 0}
                             </span>{" "}
                             runs today
                           </span>
@@ -1736,7 +1759,7 @@ export default function Home() {
                           </span>
                           <span className="text-lg">
                             <span className="font-semibold text-white">
-                              {agentStats?.last_actions?.length || 14}
+                              {agentStats?.last_actions?.length || 0}
                             </span>{" "}
                             total trades
                           </span>
@@ -1835,8 +1858,13 @@ export default function Home() {
                     <Card className="relative bg-gradient-to-r from-white to-zinc-50 dark:from-zinc-900 dark:to-zinc-800 border-2 border-emerald-200/50 dark:border-emerald-700/50 shadow-xl w-full max-w-md">
                       <CardContent className="px-8 py-6 min-h-[480px]">
                         {showAgentRequest && pendingTradeDetails ? (
-                          // AGENT REQUEST UI - Replace all content
-                          <div className="w-full flex flex-col items-center justify-center space-y-6">
+                          // AGENT REQUEST UI - Replace all content with smooth animation
+                          <motion.div 
+                            className="w-full flex flex-col items-center justify-center space-y-6"
+                            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            transition={{ duration: 0.4, ease: "easeOut" }}
+                          >
                             <div className="text-center space-y-3">
                               <div className="w-12 h-12 bg-orange-500 text-white rounded-full flex items-center justify-center font-bold text-lg mx-auto">
                                 ⚡
@@ -1915,7 +1943,7 @@ export default function Home() {
                                 </Button>
                               </div>
                             </div>
-                          </div>
+                          </motion.div>
                         ) : (
                           // NORMAL 3-STEP UI
                           <>
@@ -2273,7 +2301,7 @@ export default function Home() {
           <div className="flex items-center gap-4">
             <span>Paper Trading</span>
             <span className="text-zinc-300 dark:text-zinc-600">|</span>
-            <span>Agents deployed: 1</span>
+            <span>Agents deployed: {totalAgents}</span>
           </div>
           <div className="font-semibold">
             via{" "}
