@@ -21,7 +21,7 @@ def test_storage():
     print("\n=== Testing Storage ===")
     # Create and save test state
     test_state = StateModel(
-        balance=1000.0,
+        balance=10000.0,
         holdings=0.0,
         last_5_actions=[],
         timestamp=datetime.now(timezone.utc)

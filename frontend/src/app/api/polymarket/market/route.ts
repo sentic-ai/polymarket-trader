@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-const MARKET_ID = "516710"; // Demo market
+const MARKET_ID = "561767"; // Demo market
 const POLYMARKET_API_URL = `https://gamma-api.polymarket.com/markets/${MARKET_ID}`;
 
 interface MarketData {

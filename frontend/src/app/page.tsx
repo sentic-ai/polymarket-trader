@@ -1871,12 +1871,13 @@ export default function Home() {
                                     Rationale:
                                   </div>
                                   <div className="text-xs text-zinc-600 dark:text-zinc-400">
-                                    Volume has increased 30% in the last 5
-                                    minutes, signaling strong buy momentum.
+                                    After processing the latest market
+                                    information, the agent has identified a
+                                    potential trading opportunity.
                                   </div>
                                 </div>
 
-                                <div className="flex items-center justify-between">
+                                {/* <div className="flex items-center justify-between">
                                   <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
                                     Confidence:
                                   </div>
@@ -1888,7 +1889,7 @@ export default function Home() {
                                       <div className="w-[85%] h-full bg-emerald-500 rounded-full"></div>
                                     </div>
                                   </div>
-                                </div>
+                                </div> */}
                               </div>
                             </div>
 
