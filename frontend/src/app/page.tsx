@@ -53,10 +53,21 @@ interface WebSocketMessage {
 // Helper function to check if a WebSocket message is relevant to this agent
 function isMessageForThisAgent(
   message: WebSocketMessage,
-  currentAgentId: string
+  currentAgentId: string,
+  runToAgentMap: Map<string, string>
 ): boolean {
+  // Debug logging
+  console.log(`🔍 Filtering message:`, {
+    type: message.type,
+    currentAgentId,
+    hasData: !!message.data,
+    dataAgentId: message.data?.agent_id,
+    dataKeys: message.data ? Object.keys(message.data) : [],
+  });
+
   // Always show system-wide messages (like execution_state updates)
   if (message.type === "execution_state") {
+    console.log(`✅ Allowing execution_state message`);
     return true; // System messages relevant to all
   }
 
@@ -66,14 +77,45 @@ function isMessageForThisAgent(
     const relevantRuns = message.data.runs.filter(
       (run) => run.agent_id === currentAgentId
     );
-    return relevantRuns.length > 0;
+    const result = relevantRuns.length > 0;
+    console.log(
+      `🔍 Runs array message: ${result ? "✅ ALLOW" : "❌ BLOCK"} (relevant: ${
+        relevantRuns.length
+      })`
+    );
+    return result;
   }
 
   // For single run messages, check the run's agent_id
   if (message.data?.agent_id) {
-    return message.data.agent_id === currentAgentId;
+    const result = message.data.agent_id === currentAgentId;
+    console.log(
+      `🔍 Single run message: ${result ? "✅ ALLOW" : "❌ BLOCK"} (${
+        message.data.agent_id
+      } vs ${currentAgentId})`
+    );
+    return result;
   }
 
+  // For messages with run_id (like node_update), check if the run belongs to this agent
+  const messageWithRunId = message as WebSocketMessage & { run_id?: string };
+  const messageRunId = messageWithRunId.run_id;
+  if (messageRunId && runToAgentMap.has(messageRunId)) {
+    const runAgentId = runToAgentMap.get(messageRunId);
+    const result = runAgentId === currentAgentId;
+    console.log(
+      `🔍 Run ID message: ${
+        result ? "✅ ALLOW" : "❌ BLOCK"
+      } (run ${messageRunId} belongs to ${runAgentId} vs ${currentAgentId})`
+    );
+    return result;
+  }
+
+  console.log(
+    `❌ BLOCKING message - no agent identification (run_id: ${messageRunId}, mapped: ${runToAgentMap.has(
+      messageRunId || ""
+    )})`
+  );
   return false;
 }
 
@@ -81,6 +123,9 @@ export default function Home() {
   // Get agent configuration dynamically from URL or environment variables
   const [AGENT_ID, setAgentId] = useState<string>("");
   const [BACKEND_URL, setBackendUrl] = useState<string>("");
+
+  // Track run_id to agent_id mapping for message filtering
+  const runToAgentMapping = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
     // Extract agent ID from subdomain (e.g., polymarket-trader-u7i1502d.sentic.ai)
@@ -453,6 +498,16 @@ export default function Home() {
       const runs = (await response.json()) as RunData[];
       console.log("🏃 Runs data:", runs);
 
+      // Populate run_id to agent_id mapping for existing runs
+      runs.forEach((run) => {
+        if (run.id && !runToAgentMapping.current.has(run.id)) {
+          runToAgentMapping.current.set(run.id, AGENT_ID);
+          console.log(
+            `🗺️ Added run mapping (from fetch): ${run.id} -> ${AGENT_ID}`
+          );
+        }
+      });
+
       // Convert runs to completed runs format with short IDs and extracted data
       const convertedRuns = runs
         .filter((run) => run.status === "completed")
@@ -581,21 +636,59 @@ export default function Home() {
         };
       }
 
-      if (msg.type === "execution_state" && msg.data?.execution_state) {
-        const executionState = msg.data.execution_state;
-        if (executionState === "idle") {
-          return {
-            entity: "SYSTEM",
-            message: "Agent is now ready",
-            updateAgentState: true,
+      if (msg.type === "execution_state") {
+        // Handle new agent_states structure
+        const msgWithAgentStates = msg as {
+          type: string;
+          data?: {
+            agent_states?: Record<string, string>;
+            execution_state?: string; // fallback for old format
           };
-        } else {
-          return {
-            entity: "SYSTEM",
-            message: `Agent state: ${executionState}`,
-            updateAgentState: true,
-          };
+        };
+
+        const agentStates = msgWithAgentStates.data?.agent_states;
+
+        if (agentStates && AGENT_ID && AGENT_ID in agentStates) {
+          const executionState = agentStates[AGENT_ID];
+          if (executionState === "idle") {
+            return {
+              entity: "SYSTEM",
+              message: "Agent is now ready",
+              updateAgentState: true,
+            };
+          } else {
+            return {
+              entity: "SYSTEM",
+              message: `Agent state: ${executionState}`,
+              updateAgentState: true,
+            };
+          }
         }
+
+        // Fallback to old format
+        if (msgWithAgentStates.data?.execution_state) {
+          const executionState = msgWithAgentStates.data.execution_state;
+          if (executionState === "idle") {
+            return {
+              entity: "SYSTEM",
+              message: "Agent is now ready",
+              updateAgentState: true,
+            };
+          } else {
+            return {
+              entity: "SYSTEM",
+              message: `Agent state: ${executionState}`,
+              updateAgentState: true,
+            };
+          }
+        }
+
+        // If no relevant state found, return generic message
+        return {
+          entity: "SYSTEM",
+          message: "Agent state update received",
+          updateAgentState: false,
+        };
       }
 
       if (msg.type === "status") {
@@ -967,7 +1060,11 @@ export default function Home() {
           console.log("🟢 General parsed JSON message:", message);
 
           // Filter messages by agent ID - only process messages related to this agent
-          const isRelevantMessage = isMessageForThisAgent(message, AGENT_ID);
+          const isRelevantMessage = isMessageForThisAgent(
+            message,
+            AGENT_ID,
+            runToAgentMapping.current
+          );
           if (!isRelevantMessage) {
             console.log(
               `🔇 Filtered out message - not for agent ${AGENT_ID}:`,
@@ -1005,12 +1102,20 @@ export default function Home() {
 
           if (translation.updateAgentState) {
             const message = JSON.parse(event.data);
-            if (
-              message.type === "execution_state" &&
-              message.data?.execution_state
-            ) {
-              const executionState = message.data.execution_state;
-              setIsAgentRunning(executionState !== "idle");
+            if (message.type === "execution_state") {
+              // Handle new agent_states structure
+              if (message.data?.agent_states && AGENT_ID) {
+                const agentStates = message.data.agent_states;
+                if (AGENT_ID in agentStates) {
+                  const executionState = agentStates[AGENT_ID];
+                  setIsAgentRunning(executionState !== "idle");
+                }
+              }
+              // Fallback to old format
+              else if (message.data?.execution_state) {
+                const executionState = message.data.execution_state;
+                setIsAgentRunning(executionState !== "idle");
+              }
             }
           }
 
@@ -1171,6 +1276,12 @@ export default function Home() {
 
       const data = await response.json();
       console.log("Agent started:", data);
+
+      // Store run_id to agent_id mapping for WebSocket filtering
+      if (data.id) {
+        runToAgentMapping.current.set(data.id, AGENT_ID);
+        console.log(`🗺️ Added run mapping: ${data.id} -> ${AGENT_ID}`);
+      }
 
       // TODO: Establish WebSocket connection for specific run later
       // if (data.id) {
