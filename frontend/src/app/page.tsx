@@ -81,10 +81,31 @@ function isMessageForThisAgent(
 }
 
 export default function Home() {
-  // Get agent configuration from environment variables
-  const AGENT_ID = process.env.NEXT_PUBLIC_AGENT_ID || "polymarket-trader";
-  const BACKEND_URL =
-    process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  // Get agent configuration dynamically from URL or environment variables
+  const [AGENT_ID, setAgentId] = useState<string>("");
+  const [BACKEND_URL, setBackendUrl] = useState<string>("");
+  
+  useEffect(() => {
+    // Extract agent ID from subdomain (e.g., polymarket-trader-u7i1502d.sentic.ai)
+    const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+    let agentId = "";
+    let backendUrl = "";
+    
+    if (hostname.includes('.sentic.ai')) {
+      // Extract agent ID from subdomain
+      agentId = hostname.split('.')[0];
+      backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "https://api.sentic.ai";
+    } else {
+      // Fallback to environment variables for localhost
+      agentId = process.env.NEXT_PUBLIC_AGENT_ID || "polymarket-trader";
+      backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+    }
+    
+    console.log(`🎯 Dynamic Agent ID: ${agentId}, Backend: ${backendUrl}`);
+    console.log(`🌐 Current hostname: ${hostname}`);
+    setAgentId(agentId);
+    setBackendUrl(backendUrl);
+  }, []);
 
   const MARKET_DATA_API_URL = "/api/polymarket/market";
   const INITIAL_AMOUNT = 10000;
@@ -846,6 +867,8 @@ export default function Home() {
   }, [terminalContent, shouldAutoScroll]);
 
   useEffect(() => {
+    if (!AGENT_ID || !BACKEND_URL) return; // Don't fetch until agent ID is loaded
+    
     fetchAgentStats();
 
     statsIntervalRef.current = setInterval(fetchAgentStats, 5000);
@@ -855,7 +878,7 @@ export default function Home() {
         clearInterval(statsIntervalRef.current);
       }
     };
-  }, []);
+  }, [AGENT_ID, BACKEND_URL]);
 
   useEffect(() => {
     fetchMarketData();
@@ -870,6 +893,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (!AGENT_ID || !BACKEND_URL) return; // Don't fetch until agent ID is loaded
+    
     fetchRuns();
 
     const runsIntervalRef = setInterval(fetchRuns, 5000);
@@ -877,10 +902,12 @@ export default function Home() {
     return () => {
       clearInterval(runsIntervalRef);
     };
-  }, []);
+  }, [AGENT_ID, BACKEND_URL]);
 
   // Connect to general WebSocket on component mount
   useEffect(() => {
+    if (!AGENT_ID || !BACKEND_URL) return; // Don't connect until agent ID is loaded
+    
     const connectGeneralWebSocket = () => {
       if (wsRetryCountRef.current >= MAX_RETRIES) {
         console.log(
@@ -1043,7 +1070,7 @@ export default function Home() {
         generalWsRef.current.close();
       }
     };
-  }, []);
+  }, [AGENT_ID, BACKEND_URL]);
 
   const handleApproval = async (approved: boolean) => {
     console.log(`🔔 User approval decision: ${approved ? "YES" : "NO"}`);
@@ -1447,6 +1474,19 @@ export default function Home() {
     //   }
     // }, 500); // Changed from 9000ms to 500ms since we skip pre-execute messages
   };
+
+  // Don't render anything until agent ID is loaded
+  if (!AGENT_ID || !BACKEND_URL) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full mx-auto mb-4"></div>
+          <p className="text-zinc-600 dark:text-zinc-400">Loading agent configuration...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-zinc-50 via-neutral-50 to-stone-50 dark:from-zinc-950 dark:via-neutral-950 dark:to-stone-950">
       {/* Header */}
