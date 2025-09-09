@@ -87,7 +87,7 @@ class AgentState(TypedDict, total=False):
 def build_context(state: AgentState) -> Dict[str, List[BaseMessage] | float | List[str] | datetime | bool | None]:
     print(f"CONTEXT: Starting context node at {datetime.now(tz=UTC).strftime('%H:%M:%S')}")
     """Creates the initial prompt based on persistent state."""
-    balance = state.get("balance", 1000.0)
+    balance = state.get("balance", 10000.0)
     yes_holdings = state.get("yes_holdings", 0.0)
     no_holdings = state.get("no_holdings", 0.0)
     last_actions = state.get("last_5_actions", [])
@@ -331,7 +331,7 @@ def apply_updates(state: AgentState) -> Dict[str, float | List[str] | Dict[str, 
                     usd_amount = result.get('usd_amount', 0)
                     price = result.get('price', 1)
                     
-                    current_balance = state.get('balance', 1000.0)
+                    current_balance = state.get('balance', 10000.0)
                     current_yes_holdings = state.get('yes_holdings', 0.0)
                     current_no_holdings = state.get('no_holdings', 0.0)
                     
