@@ -1,57 +1,66 @@
-# sentic-polymarket-trader
+# Polymarket AI Agent
 
-LLM-driven Polymarket trader demo with run trace, stats, and Sentic deployment badge.
+> AI-powered autonomous trading agent for Polymarket prediction markets, built with LangGraph
 
-A LangGraph-based agent that autonomously trades a fixed Polymarket contract based on market odds and news sentiment.
+An intelligent trading bot that analyzes news sentiment and market data to make informed bets on prediction markets. Features human-in-the-loop trade approvals and real-time market monitoring.
 
-## Setup
+![Agent Flow Diagram](docs/agent-flow.jpg)
 
-1. Install the package in editable mode:
-
-   ```bash
-   pip install -e .
-   ```
-
-2. Copy `.env.example` to `.env` and fill in your API keys:
-   ```bash
-   cp .env.example .env
-   # edit .env with your keys
-   ```
-
-## Usage
-
-### Quick Test
-
-Run the example script to test the tools:
+## 🚀 Quick Start
 
 ```bash
-python examples/quickstart.py
+# Clone and install
+git clone https://github.com/sentic-ai/polymarket-trader.git
+cd polymarket_agent
+pip install -e .
+
+# Configure API keys
+cp .env.example .env
+# Add your OpenAI, Tavily, and Polymarket keys
+
+# Run the agent
+langgraph dev
 ```
 
-### LangGraph Studio
+## ⚡ Features
 
-To visualize and debug the agent graph:
+- **🧠 LLM-Powered Analysis**: GPT-5-mini analyzes market data + news sentiment
+- **📊 Real-time Market Data**: Live integration with Polymarket Gamma API
+- **📰 News Intelligence**: Tavily API for relevant news + impact analysis
+- **🛡️ Human Approval**: Trade execution requires user confirmation
 
-1. Install LangGraph Studio:
+## 🏗️ Architecture
 
-   ```bash
-   pip install langgraph-studio
-   ```
+The agent uses a LangGraph state machine with these nodes:
 
-2. Start the UI:
+1. **Entry Guard** - Rate limiting and market change detection
+2. **Context Builder** - Builds system prompt with current state
+3. **Trader Brain** - LLM with tools (market data, news, trade)
+4. **Tool Execution** - Executes API calls and tool functions
+5. **State Updates** - Updates balances and trade history
 
-   ```bash
-   langgraph studio
-   ```
+## 🔧 Configuration
 
-3. Open http://localhost:8000 and load the `trader` graph.
+Key environment variables:
 
-## Configuration
+```bash
+POLY_AGENT_MODEL=gpt-5-mini           # LLM model
+POLY_AGENT_MAX_STEPS=6                # Max tool calls per run
+POLYMARKET_MARKET_ID=516713           # Target market
+OPENAI_API_KEY=sk-...                 # Required
+TAVILY_API_KEY=tvly-...               # For news
+```
 
-Environment variables:
+## 📱 Frontend Dashboard
 
-- `POLY_AGENT_MODEL`: LLM to use (default: gpt-4o-mini)
-- `POLY_AGENT_MAX_STEPS`: Maximum tool calls per tick (default: 2)
-- `NEWS_API_KEY`: For real news (optional, falls back to demo data)
-- `POLYMARKET_MARKET_ID`: Target market ID (default: btc-70k-2025-07-31)
-- `POLY_AGENT_DATA_DIR`: Where to store state/orders (default: data/)
+The React frontend provides:
+
+- Real-time trade monitoring
+- Agent decision explanations
+- Portfolio performance tracking
+- Manual trade approval interface
+
+```bash
+cd frontend
+npm install && npm run dev
+```
